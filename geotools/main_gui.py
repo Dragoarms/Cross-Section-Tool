@@ -43,6 +43,7 @@ from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibr
 from .contact_extraction import ContactExtractor, GroupedContact, extract_contacts_grouped
 from .tie_line_editor import TieLineEditor, open_tie_line_editor
 from .pdf_annotation_writer import PDFAnnotationWriter, write_assignments_batch
+from .model_boundary import extract_model_boundary, ModelBoundary
 
 # Configure logging
 logging.basicConfig(
@@ -138,6 +139,10 @@ class GeologicalCrossSectionGUI:
         self.section_count_var = tk.IntVar(value=1)
         self.view_mode = tk.StringVar(value="section")  # "section" or "3d"
 
+        # Model boundaries for each section
+        self.model_boundaries = {}  # {northing: ModelBoundary}
+        self.show_boundaries_var = tk.BooleanVar(value=True)  # Show model boundary lines
+
         # Pan/drag state
         self.pan_active = False
         self.pan_start = None
@@ -201,6 +206,9 @@ class GeologicalCrossSectionGUI:
 
         # Tab 3: 3D visualization
         self.create_3d_tab()
+
+        # Bind tab change event
+        self.main_notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
         # Status bar
         self.status_var = tk.StringVar(value="Ready - Import PDFs to begin")
@@ -849,6 +857,18 @@ class GeologicalCrossSectionGUI:
             strat_column=self.strat_column
         )
     
+    def on_tab_changed(self, event):
+        """Handle tab change events."""
+        try:
+            tab_index = self.main_notebook.index(self.main_notebook.select())
+            if tab_index == 1:  # Tie Lines tab
+                # Refresh tie lines tab when switching to it
+                if self.grouped_contacts and self.northings:
+                    self.refresh_tie_group_list()
+                    self.update_tie_display()
+        except Exception as e:
+            logger.debug(f"Tab change handler: {e}")
+
     def switch_to_tie_lines_tab(self):
         """Switch to the tie lines tab and refresh display."""
         if not self.grouped_contacts:
@@ -1395,7 +1415,10 @@ class GeologicalCrossSectionGUI:
         """Move to previous section in tie editor."""
         if self.tie_current_center_section > 0:
             self.tie_current_center_section -= 1
-            self.tie_section_combo.current(self.tie_current_center_section)
+            # Ensure combo values are populated before setting index
+            combo_values = self.tie_section_combo['values']
+            if combo_values and self.tie_current_center_section < len(combo_values):
+                self.tie_section_combo.current(self.tie_current_center_section)
             self.cancel_tie()
             self.update_tie_display()
 
@@ -1403,7 +1426,10 @@ class GeologicalCrossSectionGUI:
         """Move to next section in tie editor."""
         if self.tie_current_center_section < len(self.northings) - 1:
             self.tie_current_center_section += 1
-            self.tie_section_combo.current(self.tie_current_center_section)
+            # Ensure combo values are populated before setting index
+            combo_values = self.tie_section_combo['values']
+            if combo_values and self.tie_current_center_section < len(combo_values):
+                self.tie_section_combo.current(self.tie_current_center_section)
             self.cancel_tie()
             self.update_tie_display()
 
@@ -1939,6 +1965,23 @@ class GeologicalCrossSectionGUI:
                         self.georeferencer.coord_system = coord_system
                         transform = self.georeferencer.build_transformation()
 
+                    # Extract model boundary if we have a transform
+                    if transform and coord_system:
+                        try:
+                            section_northing_val = coord_system.get("northing", 0.0)
+                            transform_func = lambda x, y: (transform(x, y)[0], transform(x, y)[2])  # (easting, rl)
+                            model_boundary = extract_model_boundary(
+                                page=page,
+                                transform_func=transform_func,
+                                northing=section_northing_val,
+                                section_key=(pdf_path, page_num)
+                            )
+                            if model_boundary:
+                                self.model_boundaries[section_northing_val] = model_boundary
+                                logger.debug(f"Extracted model boundary for section N={section_northing_val}")
+                        except Exception as e:
+                            logger.debug(f"Could not extract model boundary: {e}")
+
                     # Process units
                     page_units = {}
 
@@ -2459,6 +2502,58 @@ class GeologicalCrossSectionGUI:
                         "pdf": section_data.get("pdf_path"),
                         "page": section_data.get("page_num"),
                     }
+
+            # Draw contacts from grouped_contacts
+            if self.grouped_contacts:
+                for group_name, group in self.grouped_contacts.items():
+                    for polyline in group.polylines:
+                        if abs(polyline.northing - northing) < 0.1:
+                            vertices = polyline.vertices
+                            if len(vertices) >= 4:
+                                x = [vertices[j] for j in range(0, len(vertices), 2)]
+                                z = [vertices[j + 1] for j in range(0, len(vertices), 2)]
+
+                                # Apply transparency based on classification mode
+                                mode = getattr(self, 'classification_mode', 'none')
+                                if mode == 'polygon' or mode == 'fault':
+                                    contact_alpha = 0.3
+                                    contact_width = 1.5
+                                else:
+                                    contact_alpha = 0.9
+                                    contact_width = 2.5
+
+                                # Draw contact as green dashed line
+                                ax.plot(
+                                    x, z,
+                                    color='#00AA00',  # Green
+                                    linewidth=contact_width,
+                                    linestyle='-',
+                                    alpha=contact_alpha,
+                                    zorder=8,  # Below faults but above polygons
+                                    label=f"Contact: {group_name}" if i == 0 else None,
+                                )
+
+            # Draw model boundary if available and enabled
+            if self.show_boundaries_var.get() and northing in self.model_boundaries:
+                boundary = self.model_boundaries[northing]
+                if hasattr(boundary, 'topography') and boundary.topography:
+                    topo_x = [pt[0] for pt in boundary.topography]
+                    topo_y = [pt[1] for pt in boundary.topography]
+                    ax.plot(
+                        topo_x, topo_y,
+                        color='#8B4513',  # Brown
+                        linewidth=1.5,
+                        linestyle='-',
+                        alpha=0.7,
+                        zorder=5,  # Below everything selectable
+                    )
+                if hasattr(boundary, 'bounding_box') and boundary.bounding_box:
+                    e_min, rl_min, e_max, rl_max = boundary.bounding_box
+                    # Draw vertical boundary lines (left and right edges)
+                    ax.axvline(x=e_min, color='#555555', linewidth=1, linestyle=':', alpha=0.5, zorder=3)
+                    ax.axvline(x=e_max, color='#555555', linewidth=1, linestyle=':', alpha=0.5, zorder=3)
+                    # Draw bottom boundary
+                    ax.axhline(y=rl_min, color='#555555', linewidth=1, linestyle=':', alpha=0.5, zorder=3)
 
             # Configure axes
             ax.set_title(f"Section {int(northing)}", fontsize=10)

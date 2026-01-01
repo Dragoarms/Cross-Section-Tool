@@ -827,63 +827,45 @@ def extract_contact_points(
         
         mid_x = (pt1[0] + nearest_pt2[0]) / 2
         mid_y = (pt1[1] + nearest_pt2[1]) / 2
-        
-        # Skip if near a fault
-        if fault_lines:
-            mid_pt = Point(mid_x, mid_y)
-            near_fault = False
-            for fault in fault_lines:
-                if fault.distance(mid_pt) < fault_exclusion_distance:
-                    near_fault = True
-                    break
-            if near_fault:
-                continue
-        
         points.append((mid_x, mid_y))
-    
+
     # Also sample from boundary2 to boundary1
     for pt2 in boundary2_points:
         min_dist = float('inf')
         nearest_pt1 = None
-        
+
         for pt1 in boundary1_points:
             d = _point_distance(pt2, pt1)
             if d < min_dist:
                 min_dist = d
                 nearest_pt1 = pt1
-        
+
         if min_dist > proximity_threshold or nearest_pt1 is None:
             continue
-        
+
         mid_x = (pt2[0] + nearest_pt1[0]) / 2
         mid_y = (pt2[1] + nearest_pt1[1]) / 2
-        
-        if fault_lines:
-            mid_pt = Point(mid_x, mid_y)
-            near_fault = False
-            for fault in fault_lines:
-                if fault.distance(mid_pt) < fault_exclusion_distance:
-                    near_fault = True
-                    break
-            if near_fault:
-                continue
-        
         points.append((mid_x, mid_y))
-    
+
     # Remove duplicates
     if points:
         points = _remove_duplicate_points(points, tolerance=sample_distance / 3)
-    
+
     # Sort using nearest-neighbor
     if len(points) > 2:
         points = _sort_points_nearest_neighbor(points)
     else:
         points.sort(key=lambda p: p[0])
-    
+
     # Clean the polyline
     if len(points) > 3:
         points = _clean_polyline(points, simplify_tolerance=2.0)
-    
+
+    # Terminate at faults (instead of excluding points near faults)
+    # This gives clean termination rather than gaps
+    if fault_lines and len(points) >= 2:
+        points = terminate_at_faults(points, fault_lines, tolerance=fault_exclusion_distance)
+
     return points
 
 
@@ -938,37 +920,28 @@ def extract_contacts_multi_unit(
     for contact_name, midpoints in contact_midpoints.items():
         if len(midpoints) < 2:
             continue
-        
+
         # Convert to simple point list
         points = [(mp.x, mp.y) for mp in midpoints]
-        
-        # Exclude points near faults
-        if fault_lines:
-            filtered_points = []
-            for pt in points:
-                mid_pt = Point(pt[0], pt[1])
-                near_fault = False
-                for fault in fault_lines:
-                    if fault.distance(mid_pt) < fault_exclusion_distance:
-                        near_fault = True
-                        break
-                if not near_fault:
-                    filtered_points.append(pt)
-            points = filtered_points
-        
+
         if len(points) < 2:
             continue
-        
+
         # Remove duplicates
         points = _remove_duplicate_points(points, tolerance=sample_distance / 3)
-        
+
         # Sort using nearest-neighbor
         points = _sort_points_nearest_neighbor(points, max_gap)
-        
+
         # Clean the polyline
         if len(points) > 3:
             points = _clean_polyline(points, simplify_tolerance)
-        
+
+        # Terminate at faults (instead of excluding points near faults)
+        # This gives clean termination rather than gaps
+        if fault_lines and len(points) >= 2:
+            points = terminate_at_faults(points, fault_lines, tolerance=fault_exclusion_distance)
+
         if len(points) >= 2:
             result[contact_name] = points
             logger.debug(f"Contact {contact_name}: {len(points)} cleaned points")
@@ -1584,3 +1557,145 @@ def terminate_at_topography(
             result.append((e, rl))
 
     return result
+
+
+def terminate_at_faults(
+    contact_coords: List[Tuple[float, float]],
+    fault_lines: List[LineString],
+    tolerance: float = 5.0
+) -> List[Tuple[float, float]]:
+    """
+    Terminate a contact line where it meets fault lines.
+
+    Instead of simply excluding points near faults (which creates gaps),
+    this function clips the contact polyline at fault intersections,
+    giving clean termination points.
+
+    Args:
+        contact_coords: List of (easting, rl) tuples
+        fault_lines: List of Shapely LineString objects representing faults
+        tolerance: Buffer distance for detecting intersection
+
+    Returns:
+        List of clipped contact coordinates (may return multiple segments)
+    """
+    if not fault_lines or len(contact_coords) < 2:
+        return contact_coords
+
+    try:
+        contact_line = LineString(contact_coords)
+
+        # Create a union of all fault buffers
+        fault_buffers = []
+        for fault in fault_lines:
+            if fault and not fault.is_empty:
+                fault_buffers.append(fault.buffer(tolerance))
+
+        if not fault_buffers:
+            return contact_coords
+
+        fault_union = unary_union(fault_buffers)
+
+        # Get the difference - parts of contact NOT intersecting faults
+        result = contact_line.difference(fault_union)
+
+        if result.is_empty:
+            return []
+
+        if result.geom_type == 'LineString':
+            return list(result.coords)
+        elif result.geom_type == 'MultiLineString':
+            # Return the longest continuous segment
+            longest = max(result.geoms, key=lambda g: g.length)
+            return list(longest.coords)
+        else:
+            return contact_coords
+
+    except Exception as e:
+        logger.warning(f"Error terminating contact at faults: {e}")
+        return contact_coords
+
+
+def clip_contact_at_faults(
+    contact_coords: List[Tuple[float, float]],
+    fault_lines: List[LineString],
+    snap_distance: float = 10.0
+) -> List[List[Tuple[float, float]]]:
+    """
+    Clip a contact line at fault intersections, returning multiple segments.
+
+    This is useful when a contact crosses multiple faults and should be
+    split into separate segments that terminate cleanly at each fault.
+
+    Args:
+        contact_coords: List of (easting, rl) tuples
+        fault_lines: List of Shapely LineString objects representing faults
+        snap_distance: Distance to snap endpoints to fault lines
+
+    Returns:
+        List of contact segments, each a list of (easting, rl) tuples
+    """
+    if not fault_lines or len(contact_coords) < 2:
+        return [contact_coords]
+
+    try:
+        contact_line = LineString(contact_coords)
+        segments = []
+
+        # Find all intersection points with faults
+        cut_points = []
+        for fault in fault_lines:
+            if fault and not fault.is_empty:
+                intersection = contact_line.intersection(fault)
+                if intersection.is_empty:
+                    continue
+
+                if intersection.geom_type == 'Point':
+                    cut_points.append(intersection)
+                elif intersection.geom_type == 'MultiPoint':
+                    cut_points.extend(intersection.geoms)
+
+        if not cut_points:
+            return [contact_coords]
+
+        # Sort cut points along the contact line
+        cut_distances = []
+        for pt in cut_points:
+            d = contact_line.project(pt)
+            cut_distances.append((d, pt))
+        cut_distances.sort(key=lambda x: x[0])
+
+        # Split the line at cut points
+        current_start = 0.0
+        for d, pt in cut_distances:
+            if d > current_start + 1.0:  # Minimum segment length
+                # Extract segment from current_start to d
+                segment_coords = []
+                for i, (e, rl) in enumerate(contact_coords):
+                    pt_on_line = contact_line.project(Point(e, rl))
+                    if current_start <= pt_on_line <= d:
+                        segment_coords.append((e, rl))
+
+                if len(segment_coords) >= 2:
+                    # Snap endpoint to fault intersection
+                    segment_coords[-1] = (pt.x, pt.y)
+                    segments.append(segment_coords)
+
+            current_start = d
+
+        # Add final segment
+        if current_start < contact_line.length - 1.0:
+            segment_coords = []
+            for e, rl in contact_coords:
+                pt_on_line = contact_line.project(Point(e, rl))
+                if pt_on_line >= current_start:
+                    segment_coords.append((e, rl))
+
+            if len(segment_coords) >= 2:
+                segments.append(segment_coords)
+
+        return segments if segments else [contact_coords]
+
+    except Exception as e:
+        logger.warning(f"Error clipping contact at faults: {e}")
+        return [contact_coords]
