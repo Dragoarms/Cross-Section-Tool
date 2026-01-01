@@ -177,6 +177,13 @@ class GeologicalCrossSectionGUI:
         self.contact_node_patches = {}  # Maps matplotlib scatter artists to node data
         self.contact_editing = False  # True when editing contact nodes
 
+        # Contact node editing state
+        self.selected_contact_nodes = []  # List of (group_name, node_idx) for selected nodes
+        self.dragging_node = None  # (group_name, node_idx) when dragging a node
+        self.drag_start_pos = None  # (x, y) when drag started
+        self.last_click_time = 0  # For double-click detection
+        self.last_click_pos = None  # For double-click detection
+
         # Classification mode state
         self.classification_mode = "none"  # "none", "polygon", "fault", "contact"
         self.current_unit_assignment = None  # Unit name to assign when clicking
@@ -619,6 +626,11 @@ class GeologicalCrossSectionGUI:
         canvas_widget.bind("<Button-5>", self.on_mousewheel)  # Linux
         self.canvas_sections.mpl_connect("pick_event", self.on_pick)
         self.canvas_sections.mpl_connect("motion_notify_event", self.on_section_hover)
+        self.canvas_sections.mpl_connect("button_press_event", self.on_section_button_press)
+        self.canvas_sections.mpl_connect("button_release_event", self.on_section_button_release)
+        self.canvas_sections.mpl_connect("key_press_event", self.on_section_key_press)
+        # Enable keyboard focus for canvas
+        canvas_widget.bind("<Button-1>", lambda e: canvas_widget.focus_set())
         
         # Tooltip annotation (hidden initially)
         self.tooltip_annotation = None
@@ -2707,25 +2719,40 @@ class GeologicalCrossSectionGUI:
 
                                 # Draw nodes when in contact editing mode
                                 if self.contact_editing and (is_selected or mode == 'contact'):
+                                    # Determine colors based on selection state
+                                    node_colors = ['yellow'] * len(x)
+                                    node_sizes = [40] * len(x)
+                                    node_edge_widths = [0.5] * len(x)
+
+                                    # Check for selected nodes (by group_name and index)
+                                    if hasattr(self, 'selected_contact_nodes') and self.selected_contact_nodes:
+                                        for sel_group, sel_idx in self.selected_contact_nodes:
+                                            if sel_group == group_name and sel_idx < len(x):
+                                                node_colors[sel_idx] = 'cyan'
+                                                node_sizes[sel_idx] = 60
+                                                node_edge_widths[sel_idx] = 2.0
+
                                     node_scatter = ax.scatter(
                                         x, z,
-                                        c='yellow',
-                                        s=40,
+                                        c=node_colors,
+                                        s=node_sizes,
                                         edgecolors='black',
-                                        linewidths=0.5,
+                                        linewidths=node_edge_widths,
                                         zorder=15,
                                         picker=5,
                                     )
-                                    # Store node info for each point
-                                    for node_idx in range(len(x)):
-                                        self.contact_node_patches[id(node_scatter)] = {
-                                            "scatter": node_scatter,
-                                            "group_name": group_name,
-                                            "polyline": polyline,
-                                            "northing": northing,
-                                            "x_coords": x,
-                                            "z_coords": z,
-                                        }
+
+                                    scatter_id = id(node_scatter)
+
+                                    # Store node info
+                                    self.contact_node_patches[scatter_id] = {
+                                        "scatter": node_scatter,
+                                        "group_name": group_name,
+                                        "polyline": polyline,
+                                        "northing": northing,
+                                        "x_coords": x,
+                                        "z_coords": z,
+                                    }
 
             # Draw model boundary if available and enabled
             if self.show_boundaries_var.get() and northing in self.model_boundaries:
@@ -5386,16 +5413,30 @@ class GeologicalCrossSectionGUI:
         # Get the mouse event to check for right-click
         mouse_event = event.mouseevent
         is_right_click = mouse_event.button == 3
-        
+
+        # In contact editing mode, ignore polygon/polyline picks - only handle nodes
+        if self.contact_editing:
+            # Only process contact node picks
+            if hasattr(event.artist, 'get_offsets'):
+                artist_id = id(event.artist)
+                if artist_id in self.contact_node_patches:
+                    node_data = self.contact_node_patches[artist_id]
+                    if hasattr(event, 'ind') and len(event.ind) > 0:
+                        clicked_idx = event.ind[0]
+                        if is_right_click:
+                            # Right-click deletes the node
+                            self._delete_contact_node(node_data, clicked_idx)
+            return  # Skip all other pick handling in contact editing mode
+
         if event.artist in self.unit_patches:
             unit_data = self.unit_patches[event.artist]
             unit_name = unit_data["name"]
-            
+
             # Right-click to clear assignment (works in any mode)
             if is_right_click:
                 current_formation = self.all_geological_units.get(unit_name, {}).get("formation", "UNKNOWN")
                 if current_formation != "UNKNOWN" and not current_formation.startswith("UNIT"):
-                    if messagebox.askyesno("Clear Assignment", 
+                    if messagebox.askyesno("Clear Assignment",
                                           f"Clear assignment '{current_formation}' from {unit_name}?"):
                         self.clear_polygon_assignment(unit_name)
                 return
@@ -5571,12 +5612,317 @@ class GeologicalCrossSectionGUI:
 
     def toggle_contact_editing(self):
         """Toggle contact node editing mode."""
+        # Save current zoom/pan state for all axes
+        saved_limits = {}
+        if hasattr(self, 'fig_sections') and self.fig_sections:
+            for ax in self.fig_sections.get_axes():
+                saved_limits[ax] = (ax.get_xlim(), ax.get_ylim())
+
         self.contact_editing = not self.contact_editing
+
+        # Clear selection state when toggling
+        self.selected_contact_nodes = []
+        self.dragging_node = None
+
         if self.contact_editing:
-            self.status_var.set("Contact editing ON - right-click nodes to delete")
+            self.status_var.set("Contact editing ON - click to select, drag to move, right-click to delete, Del key to delete selection")
         else:
             self.status_var.set("Contact editing OFF")
+
         self.update_section_display()
+
+        # Restore zoom/pan state
+        if saved_limits:
+            for ax, (xlim, ylim) in saved_limits.items():
+                try:
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                except:
+                    pass
+            self.canvas_sections.draw_idle()
+
+    def on_section_button_press(self, event):
+        """Handle mouse button press for contact node editing."""
+        if not self.contact_editing or event.inaxes is None:
+            return
+
+        import time
+        current_time = time.time()
+
+        # Check for double-click (within 0.3 seconds and 10 pixels)
+        is_double_click = False
+        if self.last_click_time and self.last_click_pos:
+            time_diff = current_time - self.last_click_time
+            if time_diff < 0.3 and event.xdata and event.ydata:
+                pos_diff = ((event.xdata - self.last_click_pos[0])**2 +
+                           (event.ydata - self.last_click_pos[1])**2)**0.5
+                if pos_diff < 10:  # Within 10 units
+                    is_double_click = True
+
+        self.last_click_time = current_time
+        self.last_click_pos = (event.xdata, event.ydata) if event.xdata else None
+
+        if event.button == 1:  # Left click
+            # Find if we clicked on a contact node
+            clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+
+            if clicked_node:
+                group_name, node_idx, node_data = clicked_node
+
+                if is_double_click:
+                    # Double-click: select all nodes in this contact
+                    self._select_all_contact_nodes(group_name, node_data)
+                else:
+                    # Single click: toggle selection or start drag
+                    node_key = (group_name, node_idx)
+                    if node_key in self.selected_contact_nodes:
+                        # Already selected - start dragging
+                        self.dragging_node = node_key
+                        self.drag_start_pos = (event.xdata, event.ydata)
+                    else:
+                        # Not selected - select it (add to selection if shift held)
+                        if not event.key == 'shift':
+                            self.selected_contact_nodes = []
+                        self.selected_contact_nodes.append(node_key)
+                        # Also prepare for potential drag
+                        self.dragging_node = node_key
+                        self.drag_start_pos = (event.xdata, event.ydata)
+
+                    self._update_node_selection_display()
+            else:
+                # Clicked on empty space - check if clicked on contact line to break it
+                clicked_line = self._find_contact_line_at(event.xdata, event.ydata)
+                if clicked_line:
+                    group_name, segment_idx, node_data = clicked_line
+                    self._break_contact_at_segment(group_name, segment_idx, node_data)
+                else:
+                    # Clear selection
+                    self.selected_contact_nodes = []
+                    self._update_node_selection_display()
+
+    def on_section_button_release(self, event):
+        """Handle mouse button release for contact node editing."""
+        if not self.contact_editing:
+            return
+
+        if self.dragging_node and self.drag_start_pos and event.xdata and event.ydata:
+            # Check if we actually moved (not just clicked)
+            dx = event.xdata - self.drag_start_pos[0]
+            dy = event.ydata - self.drag_start_pos[1]
+            if abs(dx) > 1 or abs(dy) > 1:  # Moved more than 1 unit
+                # Move all selected nodes by the same delta
+                self._move_selected_nodes(dx, dy)
+
+        self.dragging_node = None
+        self.drag_start_pos = None
+
+    def on_section_key_press(self, event):
+        """Handle key press events for contact node editing."""
+        if not self.contact_editing:
+            return
+
+        if event.key in ('delete', 'backspace'):
+            if self.selected_contact_nodes:
+                self._delete_selected_nodes()
+
+    def _find_contact_node_at(self, x, y, tolerance=8):
+        """Find a contact node near the given coordinates."""
+        if x is None or y is None:
+            return None
+
+        for scatter_id, node_data in self.contact_node_patches.items():
+            x_coords = node_data.get('x_coords', [])
+            z_coords = node_data.get('z_coords', [])
+            group_name = node_data.get('group_name', '')
+
+            for idx, (nx, nz) in enumerate(zip(x_coords, z_coords)):
+                dist = ((x - nx)**2 + (y - nz)**2)**0.5
+                if dist < tolerance:
+                    return (group_name, idx, node_data)
+
+        return None
+
+    def _find_contact_line_at(self, x, y, tolerance=5):
+        """Find a contact line segment near the given coordinates."""
+        if x is None or y is None:
+            return None
+
+        for scatter_id, node_data in self.contact_node_patches.items():
+            x_coords = node_data.get('x_coords', [])
+            z_coords = node_data.get('z_coords', [])
+            group_name = node_data.get('group_name', '')
+
+            # Check each line segment
+            for idx in range(len(x_coords) - 1):
+                x1, y1 = x_coords[idx], z_coords[idx]
+                x2, y2 = x_coords[idx + 1], z_coords[idx + 1]
+
+                # Point-to-segment distance
+                dist = self._point_to_segment_distance(x, y, x1, y1, x2, y2)
+                if dist < tolerance:
+                    return (group_name, idx, node_data)
+
+        return None
+
+    def _point_to_segment_distance(self, px, py, x1, y1, x2, y2):
+        """Calculate distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+        dx = x2 - x1
+        dy = y2 - y1
+        seg_len_sq = dx*dx + dy*dy
+
+        if seg_len_sq < 0.0001:
+            return ((px - x1)**2 + (py - y1)**2)**0.5
+
+        t = max(0, min(1, ((px - x1)*dx + (py - y1)*dy) / seg_len_sq))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+
+        return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
+
+    def _select_all_contact_nodes(self, group_name, node_data):
+        """Select all nodes in a contact (by group_name)."""
+        x_coords = node_data.get('x_coords', [])
+
+        self.selected_contact_nodes = [(group_name, idx) for idx in range(len(x_coords))]
+        self._update_node_selection_display()
+
+        self.status_var.set(f"Selected all {len(x_coords)} nodes in {group_name}")
+
+    def _update_node_selection_display(self):
+        """Update the visual display to show selected nodes."""
+        # Save zoom
+        saved_limits = {}
+        if hasattr(self, 'fig_sections') and self.fig_sections:
+            for ax in self.fig_sections.get_axes():
+                saved_limits[ax] = (ax.get_xlim(), ax.get_ylim())
+
+        # Redraw with selection highlighting
+        self.update_section_display()
+
+        # Restore zoom
+        if saved_limits:
+            for ax, (xlim, ylim) in saved_limits.items():
+                try:
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                except:
+                    pass
+            self.canvas_sections.draw_idle()
+
+        n_selected = len(self.selected_contact_nodes)
+        if n_selected > 0:
+            self.status_var.set(f"{n_selected} node(s) selected - drag to move, Del to delete")
+
+    def _move_selected_nodes(self, dx, dy):
+        """Move all selected nodes by the given delta."""
+        if not self.selected_contact_nodes:
+            return
+
+        # Group nodes by group_name (polyline)
+        nodes_by_group = {}
+        for group_name, node_idx in self.selected_contact_nodes:
+            if group_name not in nodes_by_group:
+                nodes_by_group[group_name] = []
+            nodes_by_group[group_name].append(node_idx)
+
+        # Find polylines by group_name
+        for scatter_id, node_data in self.contact_node_patches.items():
+            group_name = node_data.get('group_name', '')
+            if group_name not in nodes_by_group:
+                continue
+
+            polyline = node_data.get('polyline')
+            if not polyline:
+                continue
+
+            # Update vertices for selected nodes in this group
+            vertices = list(polyline.vertices)
+            for node_idx in nodes_by_group[group_name]:
+                vert_idx = node_idx * 2
+                if vert_idx + 1 < len(vertices):
+                    vertices[vert_idx] += dx      # x/easting
+                    vertices[vert_idx + 1] += dy  # y/rl
+
+            polyline.vertices = vertices
+
+        self.status_var.set(f"Moved {len(self.selected_contact_nodes)} node(s)")
+        self._update_node_selection_display()
+
+    def _delete_selected_nodes(self):
+        """Delete all selected nodes."""
+        if not self.selected_contact_nodes:
+            return
+
+        # Group nodes by group_name and sort by index descending (delete from end first)
+        nodes_by_group = {}
+        for group_name, node_idx in self.selected_contact_nodes:
+            if group_name not in nodes_by_group:
+                nodes_by_group[group_name] = []
+            nodes_by_group[group_name].append(node_idx)
+
+        deleted_count = 0
+
+        # Find polylines by group_name
+        for scatter_id, node_data in self.contact_node_patches.items():
+            group_name = node_data.get('group_name', '')
+            if group_name not in nodes_by_group:
+                continue
+
+            polyline = node_data.get('polyline')
+            if not polyline:
+                continue
+
+            vertices = list(polyline.vertices)
+            n_points = len(vertices) // 2
+
+            # Sort indices descending to delete from end first
+            for node_idx in sorted(nodes_by_group[group_name], reverse=True):
+                # Need at least 2 points remaining
+                if n_points <= 2:
+                    break
+
+                vert_idx = node_idx * 2
+                if vert_idx + 1 < len(vertices):
+                    del vertices[vert_idx:vert_idx + 2]
+                    n_points -= 1
+                    deleted_count += 1
+
+            polyline.vertices = vertices
+
+            # Also update pdf_vertices if present
+            if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+                pdf_verts = list(polyline.pdf_vertices)
+                for node_idx in sorted(nodes_by_group[group_name], reverse=True):
+                    vert_idx = node_idx * 2
+                    if vert_idx + 1 < len(pdf_verts):
+                        del pdf_verts[vert_idx:vert_idx + 2]
+                polyline.pdf_vertices = pdf_verts
+
+        self.selected_contact_nodes = []
+        self.status_var.set(f"Deleted {deleted_count} node(s)")
+        self._update_node_selection_display()
+
+    def _break_contact_at_segment(self, group_name, segment_idx, node_data):
+        """Break a contact line at the given segment (between segment_idx and segment_idx+1)."""
+        polyline = node_data.get('polyline')
+        if not polyline:
+            return
+
+        vertices = list(polyline.vertices)
+        n_points = len(vertices) // 2
+
+        if n_points < 3 or segment_idx >= n_points - 1:
+            self.status_var.set("Cannot break contact - too few points")
+            return
+
+        # Select the nodes on either side of the clicked segment
+        # This allows the user to then delete one to split the contact
+        self.selected_contact_nodes = [
+            (group_name, segment_idx),
+            (group_name, segment_idx + 1)
+        ]
+        self._update_node_selection_display()
+        self.status_var.set(f"Selected segment nodes - delete one to split contact, or drag to adjust")
 
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""

@@ -725,7 +725,60 @@ def _remove_backtracking(
     
     if removed_count > 0:
         logger.debug(f"Removed {removed_count} backtracking points")
-    
+
+    return result
+
+
+def _decluster_points(
+    polyline: List[Tuple[float, float]],
+    min_distance: float = 5.0
+) -> List[Tuple[float, float]]:
+    """
+    Merge points that are too close together into single averaged points.
+
+    This helps reduce artifacts from dense sampling where many points cluster
+    together. Points within min_distance of each other are merged by averaging
+    their positions.
+
+    Args:
+        polyline: List of (x, y) tuples
+        min_distance: Minimum distance between points (default 5m)
+
+    Returns:
+        Declustered polyline with merged points
+    """
+    if len(polyline) < 2:
+        return list(polyline)
+
+    result = []
+    cluster = [polyline[0]]
+
+    for i in range(1, len(polyline)):
+        current = polyline[i]
+        # Check distance from cluster centroid
+        centroid_x = sum(p[0] for p in cluster) / len(cluster)
+        centroid_y = sum(p[1] for p in cluster) / len(cluster)
+        dist = math.sqrt((current[0] - centroid_x)**2 + (current[1] - centroid_y)**2)
+
+        if dist < min_distance:
+            # Add to current cluster
+            cluster.append(current)
+        else:
+            # Save cluster centroid and start new cluster
+            result.append((centroid_x, centroid_y))
+            cluster = [current]
+
+    # Don't forget the last cluster
+    if cluster:
+        centroid_x = sum(p[0] for p in cluster) / len(cluster)
+        centroid_y = sum(p[1] for p in cluster) / len(cluster)
+        result.append((centroid_x, centroid_y))
+
+    original_count = len(polyline)
+    new_count = len(result)
+    if original_count != new_count:
+        logger.debug(f"Declustered {original_count} points to {new_count} points (min_distance={min_distance}m)")
+
     return result
 
 
@@ -816,7 +869,8 @@ def _clean_polyline(
     simplify_tolerance: float = 2.0,
     hook_reversal_angle: float = 140.0,  # More conservative - only remove clear reversals
     hook_max_length: float = 15.0,  # Shorter max hook length
-    backtrack_angle: float = 150.0  # More conservative backtrack detection
+    backtrack_angle: float = 150.0,  # More conservative backtrack detection
+    decluster_distance: float = 5.0  # Merge points closer than this
 ) -> List[Tuple[float, float]]:
     """
     Full polyline cleaning pipeline.
@@ -827,6 +881,7 @@ def _clean_polyline(
         hook_reversal_angle: Angle indicating direction reversal for hooks
         hook_max_length: Maximum length of a hook segment
         backtrack_angle: Angle threshold for backtracking detection
+        decluster_distance: Merge points within this distance
 
     Returns:
         Cleaned and simplified polyline
@@ -836,19 +891,24 @@ def _clean_polyline(
 
     logger.debug(f"Cleaning polyline with {len(polyline)} points")
 
-    # Step 1: Simplify first to reduce noise (but preserve shape)
-    if simplify_tolerance > 0 and len(polyline) > 10:
-        result = _simplify_polyline_douglas_peucker(polyline, simplify_tolerance)
-        logger.debug(f"  After simplification: {len(result)} points")
+    # Step 1: Decluster first to merge very close points
+    if decluster_distance > 0:
+        result = _decluster_points(polyline, decluster_distance)
+        logger.debug(f"  After declustering: {len(result)} points")
     else:
         result = list(polyline)
 
-    # Step 2: Remove only very clear hooks from simplified data
+    # Step 2: Simplify to reduce noise (but preserve shape)
+    if simplify_tolerance > 0 and len(result) > 10:
+        result = _simplify_polyline_douglas_peucker(result, simplify_tolerance)
+        logger.debug(f"  After simplification: {len(result)} points")
+
+    # Step 3: Remove only very clear hooks from simplified data
     # (this is more conservative because we check against overall trend)
     result = _detect_and_trim_hooks(result, hook_reversal_angle, hook_max_length, min_points_remaining=4)
     logger.debug(f"  After hook detection: {len(result)} points")
 
-    # Step 3: Remove obvious backtracking (very conservative threshold)
+    # Step 4: Remove obvious backtracking (very conservative threshold)
     result = _remove_backtracking(result, backtrack_angle)
     logger.debug(f"  After backtrack removal: {len(result)} points")
 
