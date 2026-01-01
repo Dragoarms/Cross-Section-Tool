@@ -30,80 +30,171 @@ class SplineControlPoint:
 
 def clean_terminal_segments(
     coords: List[Tuple[float, float]],
-    min_segment_ratio: float = 0.15,
-    max_angle_change: float = 60.0
+    min_segment_ratio: float = 0.10,
+    max_angle_change: float = 45.0,
+    aggressive: bool = True
 ) -> List[Tuple[float, float]]:
     """
-    Remove short segments at the start and end of a contact line.
-    
+    Remove short segments at the start and end of a contact line (hooks).
+
     Short terminal segments often occur when the boundary-walking algorithm
     picks up spurious points as the boundary curves away from the contact zone.
-    
+
     Args:
         coords: List of (x, y) coordinate tuples
         min_segment_ratio: Minimum segment length as ratio of median segment length
         max_angle_change: Maximum angle change (degrees) to keep a short segment
-    
+        aggressive: If True, also check for sharp direction reversals
+
     Returns:
         Cleaned coordinate list
     """
     if len(coords) < 4:
         return coords
-    
+
     # Calculate all segment lengths
     lengths = []
     for i in range(len(coords) - 1):
         dx = coords[i+1][0] - coords[i][0]
         dy = coords[i+1][1] - coords[i][1]
         lengths.append(np.sqrt(dx**2 + dy**2))
-    
+
     if not lengths:
         return coords
-    
+
     median_length = np.median(lengths)
     min_length = median_length * min_segment_ratio
-    
+
     def get_angle_change(i: int) -> float:
         """Get angle change at vertex i (in degrees)."""
         if i <= 0 or i >= len(coords) - 1:
             return 0
-        
+
         v1 = np.array([coords[i][0] - coords[i-1][0], coords[i][1] - coords[i-1][1]])
         v2 = np.array([coords[i+1][0] - coords[i][0], coords[i+1][1] - coords[i][1]])
-        
+
         norm1 = np.linalg.norm(v1)
         norm2 = np.linalg.norm(v2)
         if norm1 < 1e-10 or norm2 < 1e-10:
             return 180  # Degenerate case - treat as sharp turn
-        
+
         cos_angle = np.clip(np.dot(v1, v2) / (norm1 * norm2), -1, 1)
         return np.degrees(np.arccos(cos_angle))
-    
-    # Clean from start
+
+    def is_direction_reversal(i: int, threshold: float = 120.0) -> bool:
+        """Check if there's a direction reversal at vertex i."""
+        angle = get_angle_change(i)
+        return angle > threshold
+
+    # Clean from start - look for hooks
     start_idx = 0
-    while start_idx < len(coords) - 2:
-        if lengths[start_idx] < min_length:
-            angle = get_angle_change(start_idx + 1)
-            if angle > max_angle_change:
-                start_idx += 1
-                continue
+    while start_idx < len(coords) - 3:
+        seg_len = lengths[start_idx] if start_idx < len(lengths) else 0
+        angle = get_angle_change(start_idx + 1)
+
+        # Remove if: short segment followed by sharp turn
+        if seg_len < min_length and angle > max_angle_change:
+            start_idx += 1
+            continue
+
+        # Aggressive mode: also remove direction reversals at start
+        if aggressive and is_direction_reversal(start_idx + 1):
+            start_idx += 1
+            continue
+
         break
-    
-    # Clean from end
+
+    # Clean from end - look for hooks
     end_idx = len(coords)
-    while end_idx > start_idx + 2:
+    while end_idx > start_idx + 3:
         seg_idx = end_idx - 2
-        if seg_idx >= 0 and seg_idx < len(lengths) and lengths[seg_idx] < min_length:
-            angle = get_angle_change(end_idx - 2)
-            if angle > max_angle_change:
-                end_idx -= 1
-                continue
+        seg_len = lengths[seg_idx] if 0 <= seg_idx < len(lengths) else 0
+        angle = get_angle_change(end_idx - 2)
+
+        # Remove if: short segment preceded by sharp turn
+        if seg_len < min_length and angle > max_angle_change:
+            end_idx -= 1
+            continue
+
+        # Aggressive mode: also remove direction reversals at end
+        if aggressive and is_direction_reversal(end_idx - 2):
+            end_idx -= 1
+            continue
+
         break
-    
+
     if end_idx - start_idx < 2:
         return coords
-    
+
     return coords[start_idx:end_idx]
+
+
+def remove_hooks_iterative(
+    coords: List[Tuple[float, float]],
+    max_iterations: int = 3
+) -> List[Tuple[float, float]]:
+    """
+    Iteratively remove hooks from contact endpoints.
+
+    Applies hook removal multiple times until no more changes occur
+    or max iterations reached.
+
+    Args:
+        coords: List of (x, y) coordinate tuples
+        max_iterations: Maximum cleaning passes
+
+    Returns:
+        Cleaned coordinate list
+    """
+    current = coords
+    for i in range(max_iterations):
+        cleaned = clean_terminal_segments(current, aggressive=True)
+        if len(cleaned) == len(current):
+            break
+        current = cleaned
+        logger.debug(f"Hook removal pass {i+1}: {len(coords)} -> {len(cleaned)} points")
+
+    return current
+
+
+def smooth_contact(
+    coords: List[Tuple[float, float]],
+    window_size: int = 3,
+    preserve_endpoints: bool = True
+) -> List[Tuple[float, float]]:
+    """
+    Apply moving average smoothing to contact coordinates.
+
+    Args:
+        coords: List of (x, y) coordinate tuples
+        window_size: Size of smoothing window (must be odd)
+        preserve_endpoints: If True, keep original endpoint positions
+
+    Returns:
+        Smoothed coordinate list
+    """
+    if len(coords) < window_size:
+        return coords
+
+    # Ensure odd window size
+    if window_size % 2 == 0:
+        window_size += 1
+
+    half_window = window_size // 2
+    smoothed = []
+
+    for i in range(len(coords)):
+        if preserve_endpoints and (i < half_window or i >= len(coords) - half_window):
+            smoothed.append(coords[i])
+        else:
+            start = max(0, i - half_window)
+            end = min(len(coords), i + half_window + 1)
+            window = coords[start:end]
+            avg_x = sum(c[0] for c in window) / len(window)
+            avg_y = sum(c[1] for c in window) / len(window)
+            smoothed.append((avg_x, avg_y))
+
+    return smoothed
 
 
 def resample_contact_between_ties(
@@ -500,38 +591,147 @@ def export_contacts_with_options(
 
 
 # Convenience function for cleaning contacts in-place
-def clean_all_contacts(grouped_contacts: Dict):
+def clean_all_contacts(grouped_contacts: Dict, smooth: bool = False, smooth_window: int = 3):
     """
-    Clean terminal segments from all contacts in-place.
-    
+    Clean terminal segments (hooks) from all contacts in-place.
+
+    Uses iterative hook removal for more thorough cleaning.
+
     Args:
         grouped_contacts: Dictionary of GroupedContact objects
+        smooth: If True, also apply smoothing to contacts
+        smooth_window: Window size for smoothing (if enabled)
+
+    Returns:
+        Number of contacts that were modified
     """
     cleaned_count = 0
-    
+
     for group_name, group in grouped_contacts.items():
         for polyline in group.polylines:
             vertices = polyline.vertices
-            
+
             if len(vertices) < 8:
                 continue
-            
+
             # Convert to coordinate list
             coords = []
             for i in range(0, len(vertices), 2):
                 if i + 1 < len(vertices):
                     coords.append((vertices[i], vertices[i + 1]))
-            
+
             original_len = len(coords)
-            coords = clean_terminal_segments(coords)
-            
-            if len(coords) < original_len:
+
+            # Use iterative hook removal for better results
+            coords = remove_hooks_iterative(coords, max_iterations=3)
+
+            # Optionally apply smoothing
+            if smooth and len(coords) >= smooth_window:
+                coords = smooth_contact(coords, window_size=smooth_window)
+
+            if len(coords) != original_len or smooth:
                 # Flatten back to vertex list
                 new_vertices = []
                 for x, y in coords:
                     new_vertices.extend([x, y])
                 polyline.vertices = new_vertices
                 cleaned_count += 1
-    
+
     logger.info(f"Cleaned {cleaned_count} contact polylines")
     return cleaned_count
+
+
+def delete_contact_vertex(
+    polyline,
+    vertex_idx: int
+) -> bool:
+    """
+    Delete a vertex from a contact polyline.
+
+    Args:
+        polyline: ContactPolyline object with vertices attribute
+        vertex_idx: Index of vertex to delete
+
+    Returns:
+        True if vertex was deleted
+    """
+    vertices = polyline.vertices
+    num_vertices = len(vertices) // 2
+
+    if vertex_idx < 0 or vertex_idx >= num_vertices:
+        return False
+
+    if num_vertices <= 2:
+        logger.warning("Cannot delete vertex - polyline must have at least 2 vertices")
+        return False
+
+    # Remove the vertex (2 values: x and y)
+    start_idx = vertex_idx * 2
+    del vertices[start_idx:start_idx + 2]
+
+    logger.debug(f"Deleted vertex {vertex_idx}, now {len(vertices)//2} vertices")
+    return True
+
+
+def move_contact_vertex(
+    polyline,
+    vertex_idx: int,
+    new_x: float,
+    new_y: float
+) -> bool:
+    """
+    Move a contact vertex to a new position.
+
+    Args:
+        polyline: ContactPolyline object with vertices attribute
+        vertex_idx: Index of vertex to move
+        new_x: New X coordinate
+        new_y: New Y coordinate
+
+    Returns:
+        True if vertex was moved
+    """
+    vertices = polyline.vertices
+    num_vertices = len(vertices) // 2
+
+    if vertex_idx < 0 or vertex_idx >= num_vertices:
+        return False
+
+    start_idx = vertex_idx * 2
+    vertices[start_idx] = new_x
+    vertices[start_idx + 1] = new_y
+
+    logger.debug(f"Moved vertex {vertex_idx} to ({new_x:.1f}, {new_y:.1f})")
+    return True
+
+
+def insert_contact_vertex(
+    polyline,
+    after_idx: int,
+    x: float,
+    y: float
+) -> bool:
+    """
+    Insert a new vertex after the specified index.
+
+    Args:
+        polyline: ContactPolyline object with vertices attribute
+        after_idx: Index after which to insert (use -1 to insert at start)
+        x: X coordinate of new vertex
+        y: Y coordinate of new vertex
+
+    Returns:
+        True if vertex was inserted
+    """
+    vertices = polyline.vertices
+    num_vertices = len(vertices) // 2
+
+    if after_idx < -1 or after_idx >= num_vertices:
+        return False
+
+    insert_idx = (after_idx + 1) * 2
+    vertices.insert(insert_idx, y)
+    vertices.insert(insert_idx, x)
+
+    logger.debug(f"Inserted vertex at index {after_idx + 1}: ({x:.1f}, {y:.1f})")
+    return True

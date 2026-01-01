@@ -658,6 +658,15 @@ class GeologicalCrossSectionGUI:
         ttk.Button(row2, text="Unassign Selected", width=14,
                    command=self.unassign_selected).pack(side=tk.LEFT, padx=1)
 
+        # Row 3: Bulk assignment
+        row3 = ttk.Frame(selection_controls_frame)
+        row3.pack(fill=tk.X, pady=1)
+        ttk.Label(row3, text="Assign to:").pack(side=tk.LEFT, padx=1)
+        self.bulk_assign_combo = ttk.Combobox(row3, state="readonly", width=15)
+        self.bulk_assign_combo.pack(side=tk.LEFT, padx=1)
+        ttk.Button(row3, text="Assign", width=8,
+                   command=self.bulk_assign_selected).pack(side=tk.LEFT, padx=1)
+
         # Classification mode selection
         mode_frame = ttk.LabelFrame(assignment_frame, text="Classification Mode", padding=5)
         mode_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -5429,6 +5438,43 @@ class GeologicalCrossSectionGUI:
         self.update_section_display()
         self.update_3d_view()
 
+    def bulk_assign_selected(self):
+        """Bulk assign all selected units to the unit chosen in the combobox."""
+        if not self.selected_units:
+            messagebox.showinfo("No Selection", "Please select units first using 'Select Similar' or by clicking on the map.")
+            return
+
+        unit_name = self.bulk_assign_combo.get()
+        if not unit_name:
+            messagebox.showinfo("No Unit Selected", "Please choose a unit from the dropdown.")
+            return
+
+        # Find the unit in defined_units
+        if unit_name not in self.defined_units:
+            messagebox.showerror("Error", f"Unit '{unit_name}' not found in defined units.")
+            return
+
+        assigned_count = 0
+        for feature_name in list(self.selected_units):
+            if feature_name in self.all_geological_units:
+                self._assign_polygon_to_unit(feature_name, unit_name)
+                assigned_count += 1
+
+        if assigned_count > 0:
+            self.selected_units.clear()
+            self.update_selection_display()
+            self.update_section_display()
+            messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polygons to {unit_name}")
+            logger.info(f"Bulk assigned {assigned_count} polygons to {unit_name}")
+
+    def update_bulk_assign_combo(self):
+        """Update the bulk assignment combobox with available units."""
+        if hasattr(self, 'bulk_assign_combo'):
+            unit_names = [unit.name for unit in self.strat_column.get_all_units_ordered()]
+            self.bulk_assign_combo['values'] = unit_names
+            if unit_names and not self.bulk_assign_combo.get():
+                self.bulk_assign_combo.set(unit_names[0])
+
     def assign_selected_units(self, strat_unit):
         """Assign selected units to a stratigraphic unit."""
         if not self.selected_units:
@@ -5801,11 +5847,14 @@ class GeologicalCrossSectionGUI:
             if is_expanded:
                 units_container = ttk.Frame(self.units_inner)
                 units_container.pack(fill=tk.X, padx=(20, 2), pady=1)
-                
+
                 # Create rows for each unit in this prospect
                 for unit in units_in_prospect:
                     self._create_unit_row(units_container, unit)
-    
+
+        # Update the bulk assignment combobox
+        self.update_bulk_assign_combo()
+
     def _create_unit_row(self, parent, unit: 'StratUnit'):
         """Create a single unit row with controls."""
         row_frame = ttk.Frame(parent)
@@ -6251,20 +6300,21 @@ class GeologicalCrossSectionGUI:
         
         self.assignment_label.config(text=f"Assigning to: {unit_name}")
         logger.info(f"Selected unit for assignment: {unit_name}")
-        
-        # If features are selected (from "Select Similar"), assign them all
-        if hasattr(self, 'selected_feature') and self.selected_feature:
+
+        # If features are selected (from "Select Similar" or multi-select), assign them all
+        if self.selected_units:
             assigned_count = 0
-            for feature_name in list(self.selected_feature):
+            for feature_name in list(self.selected_units):
                 # Check if it's a polygon
                 if feature_name in self.all_geological_units:
                     self._assign_polygon_to_unit(feature_name, unit_name)
                     assigned_count += 1
-            
+
             if assigned_count > 0:
                 self.status_var.set(f"Assigned {assigned_count} features to {unit_name}")
                 logger.info(f"Bulk assigned {assigned_count} features to {unit_name}")
-                self.selected_feature.clear()  # Clear selection after bulk assign
+                self.selected_units.clear()  # Clear selection after bulk assign
+                self.update_selection_display()
                 self.update_section_display()
 
     def clear_polygon_assignment(self, polygon_name: str):

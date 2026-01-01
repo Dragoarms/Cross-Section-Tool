@@ -561,22 +561,259 @@ def write_assignments_batch(
     return results
 
 
+def heal_contact_gaps(
+    contacts: List[Dict],
+    polygons: List[Dict],
+    max_snap_distance: float = 10.0
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Heal gaps by snapping polygon vertices to nearby contact lines.
+
+    This ensures polygon boundaries align properly with extracted contacts.
+
+    Args:
+        contacts: List of contact dicts with 'vertices'
+        polygons: List of polygon dicts with 'vertices'
+        max_snap_distance: Maximum distance to snap (in coordinate units)
+
+    Returns:
+        (healed_contacts, healed_polygons) - both with vertices snapped
+    """
+    import numpy as np
+
+    healed_polygons = [dict(p) for p in polygons]
+    healed_contacts = [dict(c) for c in contacts]
+    snapped_count = 0
+
+    # Build list of all contact line segments
+    contact_segments = []
+    for contact in healed_contacts:
+        vertices = contact.get('vertices', [])
+        if len(vertices) < 4:
+            continue
+        # Extract segments
+        for i in range(0, len(vertices) - 2, 2):
+            x1, y1 = vertices[i], vertices[i + 1]
+            x2, y2 = vertices[i + 2], vertices[i + 3]
+            contact_segments.append((x1, y1, x2, y2, contact))
+
+    if not contact_segments:
+        return healed_contacts, healed_polygons
+
+    def point_to_segment_distance(px, py, x1, y1, x2, y2):
+        """Calculate distance from point to line segment and nearest point on segment."""
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+
+        if length_sq < 1e-10:
+            # Segment is a point
+            return np.sqrt((px - x1)**2 + (py - y1)**2), x1, y1
+
+        # Project point onto line
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        nearest_x = x1 + t * dx
+        nearest_y = y1 + t * dy
+        dist = np.sqrt((px - nearest_x)**2 + (py - nearest_y)**2)
+
+        return dist, nearest_x, nearest_y
+
+    # Snap polygon vertices to nearby contact segments
+    for polygon in healed_polygons:
+        vertices = polygon.get('vertices', [])
+        if len(vertices) < 6:
+            continue
+
+        # Check each vertex
+        for i in range(0, len(vertices), 2):
+            if i + 1 >= len(vertices):
+                break
+
+            px, py = vertices[i], vertices[i + 1]
+            best_dist = max_snap_distance
+            best_snap = None
+
+            # Find nearest contact segment
+            for x1, y1, x2, y2, contact in contact_segments:
+                dist, snap_x, snap_y = point_to_segment_distance(px, py, x1, y1, x2, y2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_snap = (snap_x, snap_y)
+
+            # Snap if within threshold
+            if best_snap:
+                vertices[i] = best_snap[0]
+                vertices[i + 1] = best_snap[1]
+                snapped_count += 1
+
+    logger.info(f"Snapped {snapped_count} polygon vertices to contact lines")
+    return healed_contacts, healed_polygons
+
+
+def snap_contacts_to_polygons(
+    contacts: List[Dict],
+    polygons: List[Dict],
+    max_snap_distance: float = 10.0
+) -> List[Dict]:
+    """
+    Snap contact endpoints to nearby polygon boundaries.
+
+    Args:
+        contacts: List of contact dicts with 'vertices'
+        polygons: List of polygon dicts with 'vertices'
+        max_snap_distance: Maximum distance to snap
+
+    Returns:
+        List of contacts with snapped vertices
+    """
+    import numpy as np
+
+    healed_contacts = [dict(c) for c in contacts]
+    snapped_count = 0
+
+    # Build list of all polygon edge segments
+    polygon_segments = []
+    for polygon in polygons:
+        vertices = polygon.get('vertices', [])
+        if len(vertices) < 6:
+            continue
+        # Extract segments (including closing segment)
+        for i in range(0, len(vertices), 2):
+            x1, y1 = vertices[i], vertices[i + 1]
+            next_i = (i + 2) % len(vertices)
+            x2, y2 = vertices[next_i], vertices[next_i + 1]
+            polygon_segments.append((x1, y1, x2, y2))
+
+    if not polygon_segments:
+        return healed_contacts
+
+    def point_to_segment_distance(px, py, x1, y1, x2, y2):
+        """Calculate distance from point to line segment and nearest point."""
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+
+        if length_sq < 1e-10:
+            return np.sqrt((px - x1)**2 + (py - y1)**2), x1, y1
+
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        nearest_x = x1 + t * dx
+        nearest_y = y1 + t * dy
+        dist = np.sqrt((px - nearest_x)**2 + (py - nearest_y)**2)
+
+        return dist, nearest_x, nearest_y
+
+    # Snap contact vertices to polygon edges
+    for contact in healed_contacts:
+        vertices = contact.get('vertices', [])
+        if len(vertices) < 4:
+            continue
+
+        for i in range(0, len(vertices), 2):
+            if i + 1 >= len(vertices):
+                break
+
+            px, py = vertices[i], vertices[i + 1]
+            best_dist = max_snap_distance
+            best_snap = None
+
+            for x1, y1, x2, y2 in polygon_segments:
+                dist, snap_x, snap_y = point_to_segment_distance(px, py, x1, y1, x2, y2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_snap = (snap_x, snap_y)
+
+            if best_snap:
+                vertices[i] = best_snap[0]
+                vertices[i + 1] = best_snap[1]
+                snapped_count += 1
+
+    logger.info(f"Snapped {snapped_count} contact vertices to polygon edges")
+    return healed_contacts
+
+
+def extend_contacts_to_boundaries(
+    contacts: List[Dict],
+    left_boundary: float,
+    right_boundary: float,
+    extension_distance: float = 20.0
+) -> List[Dict]:
+    """
+    Extend contacts that nearly reach the section boundaries.
+
+    Args:
+        contacts: List of contact dicts with 'vertices'
+        left_boundary: Left edge X coordinate
+        right_boundary: Right edge X coordinate
+        extension_distance: Max distance from boundary to extend
+
+    Returns:
+        List of contacts with extended endpoints
+    """
+    import numpy as np
+
+    extended_contacts = [dict(c) for c in contacts]
+    extended_count = 0
+
+    for contact in extended_contacts:
+        vertices = contact.get('vertices', [])
+        if len(vertices) < 4:
+            continue
+
+        # Check start point (left end)
+        start_x, start_y = vertices[0], vertices[1]
+        if abs(start_x - left_boundary) <= extension_distance:
+            # Extend to left boundary
+            if len(vertices) >= 4:
+                # Use direction from first segment
+                dx = vertices[0] - vertices[2]
+                dy = vertices[1] - vertices[3]
+                length = np.sqrt(dx**2 + dy**2)
+                if length > 0:
+                    # Extend to boundary
+                    extend_dist = start_x - left_boundary
+                    new_x = left_boundary
+                    new_y = start_y + (dy / dx) * extend_dist if abs(dx) > 0.001 else start_y
+                    vertices[0] = new_x
+                    vertices[1] = new_y
+                    extended_count += 1
+
+        # Check end point (right end)
+        end_x, end_y = vertices[-2], vertices[-1]
+        if abs(end_x - right_boundary) <= extension_distance:
+            # Extend to right boundary
+            if len(vertices) >= 4:
+                dx = vertices[-2] - vertices[-4]
+                dy = vertices[-1] - vertices[-3]
+                length = np.sqrt(dx**2 + dy**2)
+                if length > 0:
+                    extend_dist = right_boundary - end_x
+                    new_x = right_boundary
+                    new_y = end_y + (dy / dx) * extend_dist if abs(dx) > 0.001 else end_y
+                    vertices[-2] = new_x
+                    vertices[-1] = new_y
+                    extended_count += 1
+
+    logger.info(f"Extended {extended_count} contact endpoints to boundaries")
+    return extended_contacts
+
+
 if __name__ == "__main__":
     # Test/demo code
     import sys
-    
+
     logging.basicConfig(level=logging.DEBUG)
-    
+
     if len(sys.argv) < 2:
         print("Usage: python pdf_annotation_writer.py <pdf_file>")
         print("\nThis module provides PDF annotation writing capabilities.")
         print("Import it in your main application to use its functions.")
         sys.exit(1)
-    
+
     # Simple test - list existing annotations
     pdf_path = sys.argv[1]
     doc = fitz.open(pdf_path)
-    
+
     for page_num, page in enumerate(doc):
         print(f"\nPage {page_num}:")
         for annot in page.annots():
@@ -585,5 +822,5 @@ if __name__ == "__main__":
             print(f"    Author: {info.get('title', 'N/A')}")
             print(f"    Subject: {info.get('subject', 'N/A')}")
             print(f"    Vertices: {len(annot.vertices) if annot.vertices else 0} points")
-    
+
     doc.close()
