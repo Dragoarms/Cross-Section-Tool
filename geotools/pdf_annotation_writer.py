@@ -563,97 +563,172 @@ def write_assignments_batch(
 
 def heal_contact_gaps(
     contacts: List[Dict],
-    max_gap_distance: float = 10.0,
-    snap_to_endpoints: bool = True
-) -> List[Dict]:
+    polygons: List[Dict],
+    max_snap_distance: float = 10.0
+) -> Tuple[List[Dict], List[Dict]]:
     """
-    Heal gaps between adjacent contacts by extending/connecting endpoints.
+    Heal gaps by snapping polygon vertices to nearby contact lines.
 
-    This is useful when contacts don't quite meet due to extraction artifacts.
+    This ensures polygon boundaries align properly with extracted contacts.
 
     Args:
-        contacts: List of contact dicts with 'vertices' and 'name'
-        max_gap_distance: Maximum distance to heal (in coordinate units)
-        snap_to_endpoints: If True, snap nearby endpoints together
+        contacts: List of contact dicts with 'vertices'
+        polygons: List of polygon dicts with 'vertices'
+        max_snap_distance: Maximum distance to snap (in coordinate units)
 
     Returns:
-        List of contacts with healed gaps
+        (healed_contacts, healed_polygons) - both with vertices snapped
     """
-    if len(contacts) < 2:
-        return contacts
+    import numpy as np
 
-    healed_contacts = [dict(c) for c in contacts]  # Deep copy
-    healed_count = 0
+    healed_polygons = [dict(p) for p in polygons]
+    healed_contacts = [dict(c) for c in contacts]
+    snapped_count = 0
 
-    # Get endpoints for all contacts
-    endpoints = []
-    for i, contact in enumerate(healed_contacts):
+    # Build list of all contact line segments
+    contact_segments = []
+    for contact in healed_contacts:
+        vertices = contact.get('vertices', [])
+        if len(vertices) < 4:
+            continue
+        # Extract segments
+        for i in range(0, len(vertices) - 2, 2):
+            x1, y1 = vertices[i], vertices[i + 1]
+            x2, y2 = vertices[i + 2], vertices[i + 3]
+            contact_segments.append((x1, y1, x2, y2, contact))
+
+    if not contact_segments:
+        return healed_contacts, healed_polygons
+
+    def point_to_segment_distance(px, py, x1, y1, x2, y2):
+        """Calculate distance from point to line segment and nearest point on segment."""
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+
+        if length_sq < 1e-10:
+            # Segment is a point
+            return np.sqrt((px - x1)**2 + (py - y1)**2), x1, y1
+
+        # Project point onto line
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        nearest_x = x1 + t * dx
+        nearest_y = y1 + t * dy
+        dist = np.sqrt((px - nearest_x)**2 + (py - nearest_y)**2)
+
+        return dist, nearest_x, nearest_y
+
+    # Snap polygon vertices to nearby contact segments
+    for polygon in healed_polygons:
+        vertices = polygon.get('vertices', [])
+        if len(vertices) < 6:
+            continue
+
+        # Check each vertex
+        for i in range(0, len(vertices), 2):
+            if i + 1 >= len(vertices):
+                break
+
+            px, py = vertices[i], vertices[i + 1]
+            best_dist = max_snap_distance
+            best_snap = None
+
+            # Find nearest contact segment
+            for x1, y1, x2, y2, contact in contact_segments:
+                dist, snap_x, snap_y = point_to_segment_distance(px, py, x1, y1, x2, y2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_snap = (snap_x, snap_y)
+
+            # Snap if within threshold
+            if best_snap:
+                vertices[i] = best_snap[0]
+                vertices[i + 1] = best_snap[1]
+                snapped_count += 1
+
+    logger.info(f"Snapped {snapped_count} polygon vertices to contact lines")
+    return healed_contacts, healed_polygons
+
+
+def snap_contacts_to_polygons(
+    contacts: List[Dict],
+    polygons: List[Dict],
+    max_snap_distance: float = 10.0
+) -> List[Dict]:
+    """
+    Snap contact endpoints to nearby polygon boundaries.
+
+    Args:
+        contacts: List of contact dicts with 'vertices'
+        polygons: List of polygon dicts with 'vertices'
+        max_snap_distance: Maximum distance to snap
+
+    Returns:
+        List of contacts with snapped vertices
+    """
+    import numpy as np
+
+    healed_contacts = [dict(c) for c in contacts]
+    snapped_count = 0
+
+    # Build list of all polygon edge segments
+    polygon_segments = []
+    for polygon in polygons:
+        vertices = polygon.get('vertices', [])
+        if len(vertices) < 6:
+            continue
+        # Extract segments (including closing segment)
+        for i in range(0, len(vertices), 2):
+            x1, y1 = vertices[i], vertices[i + 1]
+            next_i = (i + 2) % len(vertices)
+            x2, y2 = vertices[next_i], vertices[next_i + 1]
+            polygon_segments.append((x1, y1, x2, y2))
+
+    if not polygon_segments:
+        return healed_contacts
+
+    def point_to_segment_distance(px, py, x1, y1, x2, y2):
+        """Calculate distance from point to line segment and nearest point."""
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+
+        if length_sq < 1e-10:
+            return np.sqrt((px - x1)**2 + (py - y1)**2), x1, y1
+
+        t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / length_sq))
+        nearest_x = x1 + t * dx
+        nearest_y = y1 + t * dy
+        dist = np.sqrt((px - nearest_x)**2 + (py - nearest_y)**2)
+
+        return dist, nearest_x, nearest_y
+
+    # Snap contact vertices to polygon edges
+    for contact in healed_contacts:
         vertices = contact.get('vertices', [])
         if len(vertices) < 4:
             continue
 
-        # Start point
-        endpoints.append({
-            'contact_idx': i,
-            'is_start': True,
-            'x': vertices[0],
-            'y': vertices[1],
-        })
-        # End point
-        endpoints.append({
-            'contact_idx': i,
-            'is_start': False,
-            'x': vertices[-2],
-            'y': vertices[-1],
-        })
+        for i in range(0, len(vertices), 2):
+            if i + 1 >= len(vertices):
+                break
 
-    # Find and heal gaps
-    import numpy as np
+            px, py = vertices[i], vertices[i + 1]
+            best_dist = max_snap_distance
+            best_snap = None
 
-    for i, ep1 in enumerate(endpoints):
-        for j, ep2 in enumerate(endpoints):
-            if i >= j:  # Skip self and already checked
-                continue
-            if ep1['contact_idx'] == ep2['contact_idx']:  # Same contact
-                continue
+            for x1, y1, x2, y2 in polygon_segments:
+                dist, snap_x, snap_y = point_to_segment_distance(px, py, x1, y1, x2, y2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_snap = (snap_x, snap_y)
 
-            # Calculate distance
-            dist = np.sqrt((ep1['x'] - ep2['x'])**2 + (ep1['y'] - ep2['y'])**2)
+            if best_snap:
+                vertices[i] = best_snap[0]
+                vertices[i + 1] = best_snap[1]
+                snapped_count += 1
 
-            if dist <= max_gap_distance and dist > 0.1:
-                # Heal the gap by averaging the positions
-                mid_x = (ep1['x'] + ep2['x']) / 2
-                mid_y = (ep1['y'] + ep2['y']) / 2
-
-                # Update the contact vertices
-                contact1 = healed_contacts[ep1['contact_idx']]
-                contact2 = healed_contacts[ep2['contact_idx']]
-                vertices1 = contact1['vertices']
-                vertices2 = contact2['vertices']
-
-                if snap_to_endpoints:
-                    # Move both endpoints to the midpoint
-                    if ep1['is_start']:
-                        vertices1[0] = mid_x
-                        vertices1[1] = mid_y
-                    else:
-                        vertices1[-2] = mid_x
-                        vertices1[-1] = mid_y
-
-                    if ep2['is_start']:
-                        vertices2[0] = mid_x
-                        vertices2[1] = mid_y
-                    else:
-                        vertices2[-2] = mid_x
-                        vertices2[-1] = mid_y
-
-                    healed_count += 1
-                    logger.debug(
-                        f"Healed gap ({dist:.1f} units) between "
-                        f"{contact1.get('name', 'unknown')} and {contact2.get('name', 'unknown')}"
-                    )
-
-    logger.info(f"Healed {healed_count} contact gaps")
+    logger.info(f"Snapped {snapped_count} contact vertices to polygon edges")
     return healed_contacts
 
 
