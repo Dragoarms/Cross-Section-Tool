@@ -737,15 +737,210 @@ class PDFCalibrationDialog:
 def open_calibration_dialog(parent, pdf_path: Path = None, existing_filter: ExtractionFilter = None) -> Optional[ExtractionFilter]:
     """
     Open the calibration dialog and return the configured filter.
-    
+
     Args:
         parent: Parent window
         pdf_path: Optional PDF path to pre-load
         existing_filter: Optional existing filter to edit
-        
+
     Returns:
         ExtractionFilter if user clicked Apply, None if cancelled
     """
     dialog = PDFCalibrationDialog(parent, pdf_path, existing_filter)
     parent.wait_window(dialog.dialog)
     return dialog.get_filter()
+
+
+class AnnotationGroupFilterDialog:
+    """
+    Dialog for selecting which annotation groups to include/exclude during extraction.
+    Shows groups by author/title with checkboxes.
+    """
+
+    def __init__(self, parent, groups: Dict[str, Dict],
+                 included: Optional[set] = None, excluded: Optional[set] = None):
+        """
+        Args:
+            parent: Parent window
+            groups: Dictionary from FeatureExtractor.scan_annotation_groups() or scan_all_pages()
+            included: Pre-selected included groups (whitelist mode)
+            excluded: Pre-selected excluded groups (blacklist mode)
+        """
+        self.parent = parent
+        self.groups = groups
+        self.result_included = None  # Will be set if user clicks Apply
+        self.result_excluded = None
+        self.cancelled = True
+
+        # Create dialog
+        self.dialog = tk.Toplevel(parent)
+        self.dialog.title("Filter Annotation Groups")
+        self.dialog.geometry("500x450")
+        self.dialog.transient(parent)
+        self.dialog.grab_set()
+
+        # Variables for checkboxes
+        self.check_vars = {}
+
+        self._create_widgets(included, excluded)
+
+        # Center on parent
+        self.dialog.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - self.dialog.winfo_width()) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - self.dialog.winfo_height()) // 2
+        self.dialog.geometry(f"+{x}+{y}")
+
+    def _create_widgets(self, included, excluded):
+        """Create dialog widgets."""
+        # Instructions
+        ttk.Label(
+            self.dialog,
+            text="Select which annotation groups to include in extraction.\n"
+                 "Groups with default names (Pencil, Polygon, etc.) are typically noise.",
+            wraplength=480
+        ).pack(pady=10, padx=10)
+
+        # Quick selection buttons
+        btn_frame = ttk.Frame(self.dialog)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_frame, text="Select All", command=self._select_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Select None", command=self._select_none).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Select Non-Default", command=self._select_non_default).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="Invert", command=self._invert_selection).pack(side=tk.LEFT, padx=2)
+
+        # Scrollable frame for checkboxes
+        container = ttk.Frame(self.dialog)
+        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        canvas = tk.Canvas(container)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        self.scrollable_frame = ttk.Frame(canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind mousewheel
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Add checkboxes for each group
+        # Sort by count (descending), then by name
+        sorted_groups = sorted(
+            self.groups.items(),
+            key=lambda x: (-x[1]['count'], x[0].lower())
+        )
+
+        for group_name, info in sorted_groups:
+            var = tk.BooleanVar()
+
+            # Determine default checked state
+            if included is not None:
+                var.set(group_name in included)
+            elif excluded is not None:
+                var.set(group_name not in excluded)
+            else:
+                # Default: exclude noise names
+                var.set(not info.get('is_default_name', False))
+
+            self.check_vars[group_name] = var
+
+            # Create checkbox with info
+            row_frame = ttk.Frame(self.scrollable_frame)
+            row_frame.pack(fill=tk.X, pady=1)
+
+            cb = ttk.Checkbutton(row_frame, variable=var)
+            cb.pack(side=tk.LEFT)
+
+            # Color indicator if available
+            colors = info.get('sample_colors', [])
+            if colors:
+                color = colors[0]
+                if isinstance(color, (tuple, list)) and len(color) >= 3:
+                    hex_color = '#{:02x}{:02x}{:02x}'.format(
+                        int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
+                    )
+                    color_label = tk.Label(row_frame, bg=hex_color, width=2, height=1)
+                    color_label.pack(side=tk.LEFT, padx=2)
+
+            # Group name and count
+            types_str = ', '.join(sorted(info.get('types', set())))[:30]
+            label_text = f"{group_name} ({info['count']})"
+            if info.get('is_default_name'):
+                label_text += " [DEFAULT]"
+            if info.get('has_fault_keyword'):
+                label_text += " [FAULT]"
+
+            ttk.Label(row_frame, text=label_text).pack(side=tk.LEFT, padx=5)
+
+            if types_str:
+                ttk.Label(row_frame, text=f"({types_str})", foreground='gray').pack(side=tk.LEFT)
+
+        # Buttons
+        btn_frame2 = ttk.Frame(self.dialog)
+        btn_frame2.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(btn_frame2, text="Apply", command=self._apply).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame2, text="Cancel", command=self._cancel).pack(side=tk.RIGHT, padx=5)
+
+    def _select_all(self):
+        for var in self.check_vars.values():
+            var.set(True)
+
+    def _select_none(self):
+        for var in self.check_vars.values():
+            var.set(False)
+
+    def _select_non_default(self):
+        for group_name, var in self.check_vars.items():
+            info = self.groups.get(group_name, {})
+            var.set(not info.get('is_default_name', False))
+
+    def _invert_selection(self):
+        for var in self.check_vars.values():
+            var.set(not var.get())
+
+    def _apply(self):
+        # Build included set (whitelist of checked items)
+        self.result_included = {
+            name for name, var in self.check_vars.items() if var.get()
+        }
+        self.result_excluded = {
+            name for name, var in self.check_vars.items() if not var.get()
+        }
+        self.cancelled = False
+        self.dialog.destroy()
+
+    def _cancel(self):
+        self.cancelled = True
+        self.dialog.destroy()
+
+
+def open_annotation_filter_dialog(
+    parent,
+    groups: Dict[str, Dict],
+    included: Optional[set] = None,
+    excluded: Optional[set] = None
+) -> Tuple[Optional[set], Optional[set], bool]:
+    """
+    Open the annotation group filter dialog.
+
+    Args:
+        parent: Parent window
+        groups: Dictionary from FeatureExtractor.scan_annotation_groups()
+        included: Pre-selected included groups
+        excluded: Pre-selected excluded groups
+
+    Returns:
+        (included_set, excluded_set, cancelled)
+    """
+    dialog = AnnotationGroupFilterDialog(parent, groups, included, excluded)
+    parent.wait_window(dialog.dialog)
+    return dialog.result_included, dialog.result_excluded, dialog.cancelled

@@ -39,7 +39,7 @@ from .strat_column_v2 import StratColumnV2, StratUnit, Prospect, Fault, FaultTyp
 from .auto_labeler import AutoLabeler
 from .batch_processor import BatchProcessor
 from .section_correlation import SectionCorrelator
-from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibration_dialog
+from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibration_dialog, open_annotation_filter_dialog
 from .contact_extraction import ContactExtractor, GroupedContact, extract_contacts_grouped
 from .tie_line_editor import TieLineEditor, open_tie_line_editor
 from .pdf_annotation_writer import PDFAnnotationWriter, write_assignments_batch
@@ -430,7 +430,8 @@ class GeologicalCrossSectionGUI:
         # WORKFLOW BUTTONS - Step 2: Process
         process_frame = ttk.LabelFrame(control_panel, text="2. Process", padding=3)
         process_frame.pack(side=tk.LEFT, padx=3)
-        ttk.Button(process_frame, text=" Process All", command=self.process_all, width=11).pack(side=tk.LEFT, padx=2)
+        ttk.Button(process_frame, text="Filter...", command=self.open_annotation_filter, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Button(process_frame, text="Process All", command=self.process_all, width=11).pack(side=tk.LEFT, padx=2)
 
         # WORKFLOW BUTTONS - Step 3: Contacts
         contacts_frame = ttk.LabelFrame(control_panel, text="3. Contacts", padding=3)
@@ -1834,6 +1835,64 @@ class GeologicalCrossSectionGUI:
             except Exception as e:
                 logger.error(f"Failed to open PDF: {e}")
                 messagebox.showerror("Error", f"Failed to open PDF: {str(e)}")
+
+    def open_annotation_filter(self):
+        """Open the annotation group filter dialog to select which groups to include."""
+        if not self.pdf_list:
+            messagebox.showwarning("Warning", "Please open PDF files first")
+            return
+
+        try:
+            self.status_var.set("Scanning annotation groups...")
+            self.root.update()
+
+            # Scan all loaded PDFs for annotation groups
+            all_groups = {}
+            for pdf_path in self.pdf_list:
+                doc = fitz.open(str(pdf_path))
+                groups = FeatureExtractor.scan_all_pages(doc)
+                doc.close()
+
+                # Merge groups
+                for name, info in groups.items():
+                    if name in all_groups:
+                        all_groups[name]['count'] += info['count']
+                        all_groups[name]['types'].update(info['types'])
+                        all_groups[name]['pages'].update(info.get('pages', set()))
+                        all_groups[name]['sample_colors'].extend(info['sample_colors'][:3])
+                    else:
+                        all_groups[name] = info
+
+            if not all_groups:
+                messagebox.showinfo("Info", "No annotation groups found in PDFs")
+                return
+
+            self.status_var.set(f"Found {len(all_groups)} annotation groups")
+
+            # Open dialog
+            included, excluded, cancelled = open_annotation_filter_dialog(
+                self.root,
+                all_groups,
+                self.feature_extractor.included_groups,
+                self.feature_extractor.excluded_groups
+            )
+
+            if not cancelled:
+                # Apply filter to feature extractor
+                self.feature_extractor.set_group_filter(included=included, excluded=excluded)
+
+                # Count selected groups
+                selected_count = len(included) if included else len(all_groups) - len(excluded or set())
+                self.status_var.set(f"Filter applied: {selected_count}/{len(all_groups)} groups selected")
+
+                logger.info(f"Annotation filter applied: {selected_count} groups included")
+            else:
+                self.status_var.set("Filter cancelled")
+
+        except Exception as e:
+            logger.error(f"Error opening annotation filter: {e}")
+            messagebox.showerror("Error", f"Failed to scan annotations: {str(e)}")
+            self.status_var.set("Filter error")
 
     def process_all(self):
         """Process all pages of all loaded PDFs."""

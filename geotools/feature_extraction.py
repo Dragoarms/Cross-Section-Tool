@@ -10,7 +10,7 @@ Key filtering rules:
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 from shapely.geometry import Polygon, LineString, Point, MultiLineString
 from shapely.ops import unary_union, linemerge
 from shapely.strtree import STRtree
@@ -27,6 +27,15 @@ if not logger.handlers:
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     ch.setFormatter(formatter)
     logger.addHandler(ch)
+
+# Default names that are typically noise/sketches - can be excluded by user
+DEFAULT_NOISE_NAMES = {
+    'pencil', 'polygon', 'line', 'arrow', 'rectangle', 'square',
+    'circle', 'oval', 'ellipse', 'freehand', 'ink', 'shape',
+    'highlight', 'underline', 'strikeout', 'squiggly',
+    'text', 'note', 'comment', 'stamp', 'caret',
+    'drawing', 'sketch', 'markup', 'annotation'
+}
 
 
 class FeatureExtractor:
@@ -49,6 +58,145 @@ class FeatureExtractor:
         self.faults = []  # Extracted fault lines
         self.feature_colors = {}
         self.extraction_filter = extraction_filter
+        self.included_groups: Optional[Set[str]] = None  # If set, only include these groups
+        self.excluded_groups: Set[str] = set()  # Groups to exclude
+
+    def set_group_filter(self, included: Optional[Set[str]] = None, excluded: Optional[Set[str]] = None):
+        """
+        Set which annotation groups to include/exclude.
+
+        Args:
+            included: If set, ONLY include these groups (whitelist mode)
+            excluded: Groups to exclude (blacklist mode, used if included is None)
+        """
+        self.included_groups = included
+        self.excluded_groups = excluded or set()
+
+    def clear_group_filter(self):
+        """Clear all group filters."""
+        self.included_groups = None
+        self.excluded_groups = set()
+
+    @staticmethod
+    def scan_annotation_groups(page) -> Dict[str, Dict]:
+        """
+        Scan a PDF page and group annotations by their subject/author.
+
+        Returns:
+            Dictionary {group_name: {
+                'count': int,
+                'types': set of annotation type names,
+                'is_default_name': bool (True if matches common noise names),
+                'has_fault_keyword': bool,
+                'sample_colors': list of colors
+            }}
+        """
+        groups = defaultdict(lambda: {
+            'count': 0,
+            'types': set(),
+            'is_default_name': False,
+            'has_fault_keyword': False,
+            'sample_colors': []
+        })
+
+        type_names = {
+            0: 'Text', 1: 'Link', 2: 'FreeText', 3: 'Line', 4: 'Square',
+            5: 'Circle', 6: 'Polygon', 7: 'PolyLine', 8: 'Highlight',
+            9: 'Underline', 10: 'Squiggly', 11: 'StrikeOut', 12: 'Stamp',
+            13: 'Caret', 14: 'Ink', 15: 'Popup', 16: 'FileAttachment',
+            17: 'Sound', 18: 'Movie', 19: 'Widget', 20: 'Screen',
+            21: 'PrinterMark', 22: 'TrapNet', 23: 'Watermark', 24: '3D'
+        }
+
+        try:
+            for annot in page.annots():
+                info = annot.info if hasattr(annot, 'info') else {}
+
+                # Get group name from author/title
+                author = info.get('title') or info.get('author') or ''
+                if not author or not author.strip():
+                    author = '(No Author)'
+                else:
+                    author = author.strip()
+
+                # Get annotation type
+                annot_type = annot.type[0] if hasattr(annot, 'type') else -1
+                type_name = type_names.get(annot_type, f'Type{annot_type}')
+
+                # Get subject for fault detection
+                subject = info.get('subject', '') or info.get('content', '') or ''
+
+                # Get color
+                color = None
+                if hasattr(annot, 'colors') and annot.colors:
+                    color = annot.colors.get('stroke') or annot.colors.get('fill')
+
+                # Update group info
+                groups[author]['count'] += 1
+                groups[author]['types'].add(type_name)
+                groups[author]['is_default_name'] = author.lower() in DEFAULT_NOISE_NAMES
+
+                if 'fault' in subject.lower() or 'fault' in author.lower():
+                    groups[author]['has_fault_keyword'] = True
+
+                if color and len(groups[author]['sample_colors']) < 3:
+                    groups[author]['sample_colors'].append(tuple(color[:3]) if len(color) >= 3 else color)
+
+        except Exception as e:
+            logger.warning(f"Error scanning annotation groups: {e}")
+
+        return dict(groups)
+
+    @staticmethod
+    def scan_all_pages(doc) -> Dict[str, Dict]:
+        """
+        Scan all pages in a PDF document and aggregate annotation groups.
+
+        Args:
+            doc: PyMuPDF document object
+
+        Returns:
+            Aggregated groups dictionary
+        """
+        all_groups = defaultdict(lambda: {
+            'count': 0,
+            'types': set(),
+            'is_default_name': False,
+            'has_fault_keyword': False,
+            'sample_colors': [],
+            'pages': set()
+        })
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_groups = FeatureExtractor.scan_annotation_groups(page)
+
+            for group_name, group_info in page_groups.items():
+                all_groups[group_name]['count'] += group_info['count']
+                all_groups[group_name]['types'].update(group_info['types'])
+                all_groups[group_name]['is_default_name'] = group_info['is_default_name']
+                all_groups[group_name]['has_fault_keyword'] = group_info['has_fault_keyword']
+                all_groups[group_name]['sample_colors'].extend(group_info['sample_colors'])
+                all_groups[group_name]['pages'].add(page_num)
+
+        return dict(all_groups)
+
+    def _should_include_annotation(self, author: str) -> bool:
+        """Check if an annotation should be included based on group filters."""
+        if not author:
+            return False
+
+        author_clean = author.strip()
+
+        # Whitelist mode: only include if in included_groups
+        if self.included_groups is not None:
+            return author_clean in self.included_groups
+
+        # Blacklist mode: exclude if in excluded_groups
+        if author_clean in self.excluded_groups:
+            return False
+
+        return True
 
     def classify_feature_interactive(self, feature: Dict, feature_type: str):
         """Allow user to classify a feature interactively."""
@@ -144,6 +292,7 @@ class FeatureExtractor:
             polygons_found = 0
             faults_found = 0
             skipped_no_author = 0
+            skipped_filtered = 0
             skipped_too_few_points = 0
 
             for annot in page.annots():
@@ -156,6 +305,12 @@ class FeatureExtractor:
                 if not has_author:
                     skipped_no_author += 1
                     logger.debug(f"Skipped annotation - no author tag")
+                    continue
+
+                # Check group filter
+                if not self._should_include_annotation(author):
+                    skipped_filtered += 1
+                    logger.debug(f"Skipped annotation - filtered out group: {author}")
                     continue
 
                 # Check if this is a line/polyline (types 3, 9)
@@ -261,6 +416,7 @@ class FeatureExtractor:
             logger.info(f"  - Polygons found: {polygons_found}")
             logger.info(f"  - Faults found: {faults_found}")
             logger.info(f"  - Skipped (no author tag): {skipped_no_author}")
+            logger.info(f"  - Skipped (filtered out): {skipped_filtered}")
             logger.info(f"  - Skipped (too few points): {skipped_too_few_points}")
 
             # NOTE: We no longer extract from drawings by default since they lack author tags
