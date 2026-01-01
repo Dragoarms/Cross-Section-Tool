@@ -464,6 +464,105 @@ def extract_model_boundary(
         return None
 
 
+def create_model_boundary_from_coord_system(
+    coord_system: Dict,
+    page=None,
+    transform_func=None,
+    northing: float = 0.0,
+    section_key: Tuple = None
+) -> Optional[ModelBoundary]:
+    """
+    Create a ModelBoundary from coordinate system data.
+
+    This is the preferred method as it uses the precise section boundaries
+    identified by the georeferencer from coordinate labels.
+
+    Args:
+        coord_system: Dictionary with easting_min/max, rl_min/max, pdf_x_min/max, pdf_y_min/max
+        page: Optional PyMuPDF page object for topography extraction
+        transform_func: Function (pdf_x, pdf_y) -> (easting, rl)
+        northing: Section northing value
+        section_key: (pdf_path, page_num) tuple
+
+    Returns:
+        ModelBoundary object or None
+    """
+    if not coord_system:
+        return None
+
+    try:
+        mb = ModelBoundary(
+            northing=northing,
+            section_key=section_key,
+        )
+
+        # Set real-world bounding box from coord_system
+        easting_min = coord_system.get("easting_min")
+        easting_max = coord_system.get("easting_max")
+        rl_min = coord_system.get("rl_min")
+        rl_max = coord_system.get("rl_max")
+
+        if all(v is not None for v in [easting_min, easting_max, rl_min, rl_max]):
+            mb.bounding_box = (easting_min, rl_min, easting_max, rl_max)
+            logger.debug(f"Boundary box: E=[{easting_min}, {easting_max}], RL=[{rl_min}, {rl_max}]")
+
+        # Set PDF bounding box
+        pdf_x_min = coord_system.get("pdf_x_min")
+        pdf_x_max = coord_system.get("pdf_x_max")
+        pdf_y_min = coord_system.get("pdf_y_min")
+        pdf_y_max = coord_system.get("pdf_y_max")
+
+        if all(v is not None for v in [pdf_x_min, pdf_x_max, pdf_y_min, pdf_y_max]):
+            mb.pdf_bounding_box = (pdf_x_min, pdf_y_min, pdf_x_max, pdf_y_max)
+
+        # Try to extract topography from page if provided
+        if page and transform_func:
+            page_rect = page.rect
+            paths = extract_paths_from_page(page)
+
+            if paths:
+                topo_path = identify_topography(paths, page_rect.width, page_rect.height)
+
+                if topo_path:
+                    # Filter topography to only include points within section bounds
+                    pdf_verts = topo_path['vertices']
+
+                    # Transform and filter
+                    valid_topo = []
+                    for px, py in pdf_verts:
+                        # Only include points within the PDF section bounds
+                        if pdf_x_min and pdf_x_max and pdf_y_min and pdf_y_max:
+                            if not (pdf_x_min - 10 <= px <= pdf_x_max + 10):
+                                continue
+
+                        try:
+                            e, rl = transform_func(px, py)
+                            # Only include points within easting bounds
+                            if easting_min and easting_max:
+                                if easting_min - 50 <= e <= easting_max + 50:
+                                    valid_topo.append((e, rl))
+                            else:
+                                valid_topo.append((e, rl))
+                        except:
+                            pass
+
+                    if len(valid_topo) >= 2:
+                        # Sort by easting
+                        valid_topo.sort(key=lambda p: p[0])
+                        mb.topography = valid_topo
+                        mb.pdf_topography = [(p[0], p[1]) for p in pdf_verts]
+                        logger.debug(f"Extracted topography with {len(valid_topo)} points")
+
+        # Build geometries
+        mb.build_geometries()
+
+        return mb
+
+    except Exception as e:
+        logger.error(f"Error creating model boundary from coord_system: {e}")
+        return None
+
+
 def analyze_page_paths(page) -> Dict:
     """
     Analyze all paths on a page and return a summary.

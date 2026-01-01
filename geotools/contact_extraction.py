@@ -495,83 +495,196 @@ def _sort_points_nearest_neighbor(
     return result
 
 
+def _is_near_boundary_edge(
+    point: Tuple[float, float],
+    polyline: List[Tuple[float, float]],
+    edge_threshold_ratio: float = 0.05
+) -> bool:
+    """
+    Check if a point is near the boundary edge of the polyline's extent.
+
+    A point at the "edge" is within edge_threshold_ratio of the min/max extent.
+    This helps identify if a hook is at a natural termination point.
+    """
+    if len(polyline) < 2:
+        return True
+
+    x_coords = [p[0] for p in polyline]
+    y_coords = [p[1] for p in polyline]
+
+    x_min, x_max = min(x_coords), max(x_coords)
+    y_min, y_max = min(y_coords), max(y_coords)
+
+    x_range = x_max - x_min
+    y_range = y_max - y_min
+
+    # Check if point is near any edge
+    x_threshold = x_range * edge_threshold_ratio
+    y_threshold = y_range * edge_threshold_ratio
+
+    near_x_edge = (point[0] < x_min + x_threshold) or (point[0] > x_max - x_threshold)
+    near_y_edge = (point[1] < y_min + y_threshold) or (point[1] > y_max - y_threshold)
+
+    return near_x_edge or near_y_edge
+
+
+def _get_continuation_length(
+    polyline: List[Tuple[float, float]],
+    from_index: int,
+    direction: str = "forward"
+) -> float:
+    """
+    Calculate the total length of polyline continuing from a given index.
+
+    Args:
+        polyline: List of points
+        from_index: Index to start measuring from
+        direction: "forward" (toward end) or "backward" (toward start)
+
+    Returns:
+        Total length of the continuation
+    """
+    total_length = 0.0
+
+    if direction == "forward":
+        for i in range(from_index, len(polyline) - 1):
+            total_length += _point_distance(polyline[i], polyline[i + 1])
+    else:  # backward
+        for i in range(from_index, 0, -1):
+            total_length += _point_distance(polyline[i], polyline[i - 1])
+
+    return total_length
+
+
 def _detect_and_trim_hooks(
     polyline: List[Tuple[float, float]],
-    reversal_angle: float = 120.0,
+    reversal_angle: float = 140.0,
     max_hook_length: float = 20.0,
-    min_points_remaining: int = 5
+    min_points_remaining: int = 5,
+    model_boundary=None
 ) -> List[Tuple[float, float]]:
     """
     Detect and remove true hooks at both ends of a polyline.
-    
-    A hook is defined as a SHORT terminal segment that REVERSES direction
-    (goes back the way it came). This is different from a gentle curve.
-    
+
+    A hook is defined as a SHORT terminal segment that:
+    1. REVERSES direction sharply (angle > reversal_angle)
+    2. Is near a natural termination point (boundary edge)
+    3. Does NOT have significant polyline continuation after it
+
+    For folded contacts, even if there's a sharp reversal, if there's
+    significant continuation after the reversal point, it's preserved
+    as it's likely a fold limb, not an artifact.
+
     Args:
         polyline: List of (x, y) coordinates
-        reversal_angle: Angle (degrees) between segments that indicates reversal (>90 = turning back)
-        max_hook_length: Maximum length of segment to consider as a hook (longer = real feature)
+        reversal_angle: Angle (degrees) between segments that indicates reversal
+        max_hook_length: Maximum length of segment to consider as a hook
         min_points_remaining: Minimum points to keep in polyline
-    
+        model_boundary: Optional boundary for termination point checking
+
     Returns:
         Cleaned polyline with hooks removed
     """
     if len(polyline) < min_points_remaining + 2:
         return polyline
-    
+
     result = list(polyline)
+
+    # Calculate total polyline length for comparisons
+    total_length = sum(
+        _point_distance(polyline[i], polyline[i+1])
+        for i in range(len(polyline) - 1)
+    )
+
+    # Very short polylines - don't trim at all
+    if total_length < max_hook_length * 3:
+        return polyline
+
+    # Check start for hooks
     start_trimmed = 0
-    end_trimmed = 0
-    
-    # Trim hooks from start
-    while len(result) > min_points_remaining:
-        if len(result) < 3:
+    max_start_trim = min(3, len(result) - min_points_remaining)
+
+    while start_trimmed < max_start_trim and len(result) > min_points_remaining:
+        if len(result) < 4:
             break
-        
-        # First segment (from point 0 to point 1)
+
+        # First segment
         seg1 = _vector_subtract(result[1], result[0])
         seg1_len = _vector_length(seg1)
-        
-        # Second segment (from point 1 to point 2)
+
+        # Second segment
         seg2 = _vector_subtract(result[2], result[1])
-        
+
         angle = _angle_between_vectors(seg1, seg2)
-        
-        # Only trim if it's a SHORT segment that REVERSES direction
+
+        # Check if this looks like a hook
         if angle > reversal_angle and seg1_len < max_hook_length:
-            logger.debug(f"Trimming start hook: angle={angle:.1f}°, length={seg1_len:.1f}m")
-            result.pop(0)
-            start_trimmed += 1
+            # Calculate continuation length after the reversal
+            continuation = _get_continuation_length(result, 1, "forward")
+
+            # Check if start point is near boundary edge
+            near_edge = _is_near_boundary_edge(result[0], polyline, 0.1)
+
+            # Only trim if:
+            # 1. Near edge (natural termination point), OR
+            # 2. Very short hook with substantial continuation
+            # But NEVER trim if continuation after reversal is significant
+            # (indicates a fold limb, not an artifact)
+
+            hook_to_continuation_ratio = seg1_len / continuation if continuation > 0 else float('inf')
+
+            # If the "hook" segment is less than 5% of the continuation,
+            # and near edge, it's probably an artifact
+            if near_edge and hook_to_continuation_ratio < 0.05:
+                logger.debug(f"Trimming start hook: angle={angle:.1f}°, len={seg1_len:.1f}m, ratio={hook_to_continuation_ratio:.3f}")
+                result.pop(0)
+                start_trimmed += 1
+            else:
+                # Not a hook - it's either a fold limb or has significant geometry
+                break
         else:
             break
-    
-    # Trim hooks from end
-    while len(result) > min_points_remaining:
-        if len(result) < 3:
+
+    # Check end for hooks
+    end_trimmed = 0
+    max_end_trim = min(3, len(result) - min_points_remaining)
+
+    while end_trimmed < max_end_trim and len(result) > min_points_remaining:
+        if len(result) < 4:
             break
-        
+
         n = len(result)
-        
-        # Last segment (from point n-2 to point n-1)
+
+        # Last segment
         seg_last = _vector_subtract(result[n-1], result[n-2])
         seg_last_len = _vector_length(seg_last)
-        
-        # Second-to-last segment (from point n-3 to point n-2)
+
+        # Second-to-last segment
         seg_prev = _vector_subtract(result[n-2], result[n-3])
-        
+
         angle = _angle_between_vectors(seg_prev, seg_last)
-        
-        # Only trim if it's a SHORT segment that REVERSES direction
+
         if angle > reversal_angle and seg_last_len < max_hook_length:
-            logger.debug(f"Trimming end hook: angle={angle:.1f}°, length={seg_last_len:.1f}m")
-            result.pop()
-            end_trimmed += 1
+            # Calculate continuation length before the reversal
+            continuation = _get_continuation_length(result, n-2, "backward")
+
+            # Check if end point is near boundary edge
+            near_edge = _is_near_boundary_edge(result[-1], polyline, 0.1)
+
+            hook_to_continuation_ratio = seg_last_len / continuation if continuation > 0 else float('inf')
+
+            if near_edge and hook_to_continuation_ratio < 0.05:
+                logger.debug(f"Trimming end hook: angle={angle:.1f}°, len={seg_last_len:.1f}m, ratio={hook_to_continuation_ratio:.3f}")
+                result.pop()
+                end_trimmed += 1
+            else:
+                break
         else:
             break
-    
+
     if start_trimmed > 0 or end_trimmed > 0:
         logger.debug(f"Hook trimming: removed {start_trimmed} from start, {end_trimmed} from end")
-    
+
     return result
 
 
@@ -701,49 +814,44 @@ def _remove_duplicate_points(
 def _clean_polyline(
     polyline: List[Tuple[float, float]],
     simplify_tolerance: float = 2.0,
-    hook_reversal_angle: float = 120.0,
-    hook_max_length: float = 20.0,
-    backtrack_angle: float = 120.0
+    hook_reversal_angle: float = 140.0,  # More conservative - only remove clear reversals
+    hook_max_length: float = 15.0,  # Shorter max hook length
+    backtrack_angle: float = 150.0  # More conservative backtrack detection
 ) -> List[Tuple[float, float]]:
     """
     Full polyline cleaning pipeline.
-    
+
     Args:
         polyline: Raw sorted contact points
         simplify_tolerance: Douglas-Peucker tolerance
         hook_reversal_angle: Angle indicating direction reversal for hooks
         hook_max_length: Maximum length of a hook segment
         backtrack_angle: Angle threshold for backtracking detection
-    
+
     Returns:
         Cleaned and simplified polyline
     """
     if len(polyline) < 3:
         return polyline
-    
+
     logger.debug(f"Cleaning polyline with {len(polyline)} points")
-    
-    # Step 1: Remove hooks from dense data (before simplification)
-    result = _detect_and_trim_hooks(polyline, hook_reversal_angle, hook_max_length)
-    logger.debug(f"  After hook detection (dense): {len(result)} points")
-    
-    # Step 2: Remove backtracking from dense data
-    result = _remove_backtracking(result, backtrack_angle)
-    logger.debug(f"  After backtrack removal (dense): {len(result)} points")
-    
-    # Step 3: Simplify
-    if simplify_tolerance > 0 and len(result) > 10:
-        result = _simplify_polyline_douglas_peucker(result, simplify_tolerance)
+
+    # Step 1: Simplify first to reduce noise (but preserve shape)
+    if simplify_tolerance > 0 and len(polyline) > 10:
+        result = _simplify_polyline_douglas_peucker(polyline, simplify_tolerance)
         logger.debug(f"  After simplification: {len(result)} points")
-    
-    # Step 4: Remove hooks again (simplification can reintroduce them)
+    else:
+        result = list(polyline)
+
+    # Step 2: Remove only very clear hooks from simplified data
+    # (this is more conservative because we check against overall trend)
     result = _detect_and_trim_hooks(result, hook_reversal_angle, hook_max_length, min_points_remaining=4)
-    logger.debug(f"  After hook detection (simplified): {len(result)} points")
-    
-    # Step 5: Final backtrack check on simplified data
+    logger.debug(f"  After hook detection: {len(result)} points")
+
+    # Step 3: Remove obvious backtracking (very conservative threshold)
     result = _remove_backtracking(result, backtrack_angle)
-    logger.debug(f"  After final backtrack removal: {len(result)} points")
-    
+    logger.debug(f"  After backtrack removal: {len(result)} points")
+
     return result
 
 
@@ -1004,11 +1112,12 @@ class ContactExtractor:
         section_key: Tuple,
         unit_assignments: Optional[Dict[str, str]] = None,
         inverse_transform=None,
-        fault_lines: Optional[List[Dict]] = None
+        fault_lines: Optional[List[Dict]] = None,
+        model_boundary=None
     ) -> List[ContactPolyline]:
         """
         Extract contact points for a single section.
-        
+
         Args:
             units: Dictionary of unit data {unit_name: {"vertices": [...], ...}}
             northing: Section northing value
@@ -1016,7 +1125,8 @@ class ContactExtractor:
             unit_assignments: Optional mapping of unit names to formation names
             inverse_transform: Optional function (easting, rl) -> (pdf_x, pdf_y)
             fault_lines: Optional list of fault data dicts with "vertices" key
-        
+            model_boundary: Optional ModelBoundary object for clipping contacts
+
         Returns:
             List of ContactPolyline objects (each containing points for one contact pair)
         """
@@ -1084,23 +1194,35 @@ class ContactExtractor:
             for contact_name, points in contact_points.items():
                 if len(points) < 2:
                     continue
-                
+
+                # Clip to model boundary if available
+                if model_boundary and len(points) >= 2:
+                    # Clip to topography/boundary polygon
+                    if hasattr(model_boundary, 'boundary_polygon') and model_boundary.boundary_polygon:
+                        points = clip_contact_to_boundary(points, model_boundary.boundary_polygon)
+                    # Also terminate at topography surface
+                    if hasattr(model_boundary, 'topography') and model_boundary.topography:
+                        points = terminate_at_topography(points, model_boundary.topography)
+
+                if len(points) < 2:
+                    continue
+
                 # Check minimum length
                 total_span = max(p[0] for p in points) - min(p[0] for p in points)
                 if total_span < self.min_contact_length:
                     continue
-                
+
                 # Parse unit names from contact name
                 unit_names = contact_name.split("-")
                 if len(unit_names) != 2:
                     continue
-                
+
                 name1, name2 = unit_names
-                
+
                 # Get formation names
                 form1 = self._get_formation_name(name1, units.get(name1, {}), unit_assignments)
                 form2 = self._get_formation_name(name2, units.get(name2, {}), unit_assignments)
-                
+
                 # Convert points to flat vertex list
                 vertices = coords_to_vertices(points)
                 
@@ -1133,13 +1255,14 @@ class ContactExtractor:
         else:
             # Fall back to pairwise extraction
             contacts = self._extract_pairwise(
-                polygons, units, northing, section_key, 
-                unit_assignments, inverse_transform, fault_geometries
+                polygons, units, northing, section_key,
+                unit_assignments, inverse_transform, fault_geometries,
+                model_boundary
             )
-        
+
         logger.info(f"Extracted {len(contacts)} contacts for section N={northing}")
         return contacts
-    
+
     def _extract_pairwise(
         self,
         polygons: Dict[str, Polygon],
@@ -1148,7 +1271,8 @@ class ContactExtractor:
         section_key: Tuple,
         unit_assignments: Dict[str, str],
         inverse_transform,
-        fault_geometries: List[LineString]
+        fault_geometries: List[LineString],
+        model_boundary=None
     ) -> List[ContactPolyline]:
         """Extract contacts using pairwise boundary comparison (legacy method)."""
         contacts = []
@@ -1182,16 +1306,28 @@ class ContactExtractor:
                 
                 if len(points) < 2:
                     continue
-                
+
+                # Clip to model boundary if available
+                if model_boundary and len(points) >= 2:
+                    # Clip to topography/boundary polygon
+                    if hasattr(model_boundary, 'boundary_polygon') and model_boundary.boundary_polygon:
+                        points = clip_contact_to_boundary(points, model_boundary.boundary_polygon)
+                    # Also terminate at topography surface
+                    if hasattr(model_boundary, 'topography') and model_boundary.topography:
+                        points = terminate_at_topography(points, model_boundary.topography)
+
+                if len(points) < 2:
+                    continue
+
                 # Check minimum length
                 total_span = max(p[0] for p in points) - min(p[0] for p in points)
                 if total_span < self.min_contact_length:
                     continue
-                
+
                 # Get formation names
                 form1 = self._get_formation_name(name1, units.get(name1, {}), unit_assignments)
                 form2 = self._get_formation_name(name2, units.get(name2, {}), unit_assignments)
-                
+
                 # Convert points to flat vertex list
                 vertices = coords_to_vertices(points)
                 
@@ -1265,62 +1401,70 @@ class ContactExtractor:
     def extract_all_sections(
         self,
         all_sections_data: Dict[Tuple, Dict],
-        unit_assignments: Optional[Dict[str, str]] = None
+        unit_assignments: Optional[Dict[str, str]] = None,
+        model_boundaries: Optional[Dict] = None
     ) -> Dict[str, GroupedContact]:
         """
         Extract contacts from all sections and group by formation pair.
-        
+
         Args:
             all_sections_data: Dictionary {(pdf_path, page_num): section_data}
             unit_assignments: Optional global unit assignments
-        
+            model_boundaries: Optional dict {northing: ModelBoundary} for clipping
+
         Returns:
             Dictionary of grouped contacts {group_name: GroupedContact}
         """
         self.grouped_contacts = {}
-        
+
         if unit_assignments is None:
             unit_assignments = {}
-        
+        if model_boundaries is None:
+            model_boundaries = {}
+
         total_contacts = 0
-        
+
         for section_key, section_data in all_sections_data.items():
             units = section_data.get("units", {})
             northing = section_data.get("northing", 0)
-            
+
             if len(units) < 2:
                 continue
-            
+
             # Build section-specific assignments
             section_assignments = dict(unit_assignments)
             for unit_name, unit_data in units.items():
                 if "unit_assignment" in unit_data and unit_data["unit_assignment"]:
                     section_assignments[unit_name] = unit_data["unit_assignment"]
-            
+
             inverse_transform = section_data.get("inverse_transform")
-            
+
             # Get faults from polylines
             fault_lines = []
             polylines = section_data.get("polylines", {})
             for pl_name, pl_data in polylines.items():
                 if pl_data.get("is_fault") or "fault" in pl_name.lower():
                     fault_lines.append(pl_data)
-            
+
             # Also check direct faults key
             if section_data.get("faults"):
                 fault_lines.extend(section_data["faults"])
-            
+
+            # Get model boundary for this section if available
+            boundary = model_boundaries.get(northing)
+
             contacts = self.extract_contacts_for_section(
                 units=units,
                 northing=northing,
                 section_key=section_key,
                 unit_assignments=section_assignments,
                 inverse_transform=inverse_transform,
-                fault_lines=fault_lines if fault_lines else None
+                fault_lines=fault_lines if fault_lines else None,
+                model_boundary=boundary
             )
-            
+
             total_contacts += len(contacts)
-        
+
         logger.info(f"Extracted {total_contacts} total contacts in {len(self.grouped_contacts)} groups")
         return self.grouped_contacts
     
@@ -1345,11 +1489,12 @@ def extract_contacts_grouped(
     min_contact_length: float = 5.0,
     simplify_tolerance: float = 2.0,
     buffer_distance: float = None,
-    fault_exclusion_distance: float = 15.0
+    fault_exclusion_distance: float = 15.0,
+    model_boundaries: Optional[Dict] = None
 ) -> Dict[str, GroupedContact]:
     """
     Convenience function to extract grouped contacts from section data.
-    
+
     Args:
         all_sections_data: Dictionary {(pdf_path, page_num): section_data}
         unit_assignments: Optional mapping of unit names to formation names
@@ -1359,13 +1504,14 @@ def extract_contacts_grouped(
         simplify_tolerance: Douglas-Peucker simplification tolerance
         buffer_distance: Alias for proximity_threshold
         fault_exclusion_distance: Exclude points within this distance of faults
-    
+        model_boundaries: Optional dict {northing: ModelBoundary} for clipping contacts
+
     Returns:
         Dictionary of grouped contacts {group_name: GroupedContact}
     """
     if buffer_distance is not None:
         proximity_threshold = buffer_distance
-    
+
     extractor = ContactExtractor(
         proximity_threshold=proximity_threshold,
         sample_distance=sample_distance,
@@ -1373,8 +1519,8 @@ def extract_contacts_grouped(
         simplify_tolerance=simplify_tolerance,
         fault_exclusion_distance=fault_exclusion_distance
     )
-    
-    return extractor.extract_all_sections(all_sections_data, unit_assignments)
+
+    return extractor.extract_all_sections(all_sections_data, unit_assignments, model_boundaries)
 
 
 def extract_single_contact(

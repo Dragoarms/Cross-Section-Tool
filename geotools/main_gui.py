@@ -43,7 +43,7 @@ from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibr
 from .contact_extraction import ContactExtractor, GroupedContact, extract_contacts_grouped
 from .tie_line_editor import TieLineEditor, open_tie_line_editor
 from .pdf_annotation_writer import PDFAnnotationWriter, write_assignments_batch
-from .model_boundary import extract_model_boundary, ModelBoundary
+from .model_boundary import extract_model_boundary, create_model_boundary_from_coord_system, ModelBoundary
 
 # Configure logging
 logging.basicConfig(
@@ -109,10 +109,14 @@ class GeologicalCrossSectionGUI:
         self.selected_units = set()  # Selected units for assignment
         self.unit_patches = {}  # Maps matplotlib patches to unit data
         self.polyline_patches = {}  # Maps matplotlib lines to polyline data
+        self.contact_patches = {}  # Maps matplotlib lines to contact data
         self.selected_polylines = set()  # Selected polylines for fault assignment
-        
+        self.selected_contacts = set()  # Selected contacts (group names)
+        self.contact_node_patches = {}  # Maps matplotlib scatter artists to node data
+        self.contact_editing = False  # True when editing contact nodes
+
         # Classification mode state
-        self.classification_mode = "none"  # "none", "polygon", "fault"
+        self.classification_mode = "none"  # "none", "polygon", "fault", "contact"
         self.current_unit_assignment = None  # Unit name to assign when clicking
         self.current_fault_assignment = None  # Fault name to assign when clicking
         
@@ -445,6 +449,7 @@ class GeologicalCrossSectionGUI:
         contacts_frame = ttk.LabelFrame(control_panel, text="3. Contacts", padding=3)
         contacts_frame.pack(side=tk.LEFT, padx=3)
         ttk.Button(contacts_frame, text="Extract", command=self.extract_contacts_grouped, width=9).pack(side=tk.LEFT, padx=2)
+        ttk.Button(contacts_frame, text="Edit Nodes", command=self.toggle_contact_editing, width=9).pack(side=tk.LEFT, padx=2)
         ttk.Button(contacts_frame, text="Tie Lines", command=self.switch_to_tie_lines_tab, width=10).pack(side=tk.LEFT, padx=2)
 
         # Navigation frame
@@ -790,14 +795,15 @@ class GeologicalCrossSectionGUI:
                 if unit_data.get("unit_assignment"):
                     unit_assignments[unit_name] = unit_data["unit_assignment"]
             
-            # Use new contact extractor
+            # Use new contact extractor (with model boundaries for clean termination)
             self.grouped_contacts = extract_contacts_grouped(
                 all_sections_data=self.all_sections_data,
                 unit_assignments=unit_assignments,
                 sample_distance=2.0,
                 proximity_threshold=10.0,
                 min_contact_length=5.0,
-                simplify_tolerance=1.0
+                simplify_tolerance=1.0,
+                model_boundaries=self.model_boundaries
             )
             
             # Also populate legacy all_contacts for backward compatibility
@@ -1229,82 +1235,119 @@ class GeologicalCrossSectionGUI:
                 self.tie_line_artists.append(line)
 
     def on_tie_click(self, event):
-        """Handle click in tie line editor."""
+        """Handle click in tie line editor.
+
+        Supports continuous tie line drawing:
+        - Left click: Start drawing or add next tie point (continuous mode)
+        - Right click: End drawing mode
+        - Click on contact to snap to vertices
+        """
         if event.inaxes != self.ax_ties:
             return
 
-        # Check if clicked on a contact
+        # Right click ends drawing mode
+        if event.button == 3:
+            if self.drawing_tie:
+                self.tie_status_label.config(text="Tie drawing finished")
+                self.drawing_tie = False
+                self.tie_line_start = None
+                if self.temp_tie_line:
+                    self.temp_tie_line.remove()
+                    self.temp_tie_line = None
+                self.update_tie_display()
+            return
+
+        # Left click - find clicked contact
+        clicked_info = None
         for line, info in self.tie_contact_lines.items():
-            # Skip lines without a figure to avoid matplotlib warnings
             if line.figure is None:
                 continue
             contains, _ = line.contains(event)
             if contains:
-                if not self.drawing_tie:
-                    # Start new tie - snap to nearest vertex
+                clicked_info = info
+                break
+
+        if clicked_info is None:
+            return
+
+        info = clicked_info
+
+        if not self.drawing_tie:
+            # Start new tie chain - snap to nearest vertex
+            raw_rl = event.ydata - info['y_offset']
+            snapped_e, snapped_rl = self._snap_to_nearest_vertex(
+                event.xdata, raw_rl, info['group'], info['northing']
+            )
+
+            self.tie_current_contact_group = info['group']
+            self.tie_line_start = {
+                'northing': info['northing'],
+                'easting': snapped_e,
+                'rl': snapped_rl,
+                'y_offset': info['y_offset']
+            }
+            self.drawing_tie = True
+            self.tie_status_label.config(
+                text=f"Drawing ties from N{int(info['northing'])} - click to add, right-click to stop"
+            )
+
+            # Update listbox selection
+            group_names = list(self.grouped_contacts.keys())
+            try:
+                idx = group_names.index(info['group'])
+                self.tie_group_listbox.selection_clear(0, tk.END)
+                self.tie_group_listbox.selection_set(idx)
+            except ValueError:
+                pass
+
+            self.update_tie_display()
+        else:
+            # Continue tie chain - add tie and continue from this point
+            if info['group'] == self.tie_current_contact_group:
+                start_northing = self.tie_line_start['northing']
+                end_northing = info['northing']
+
+                if abs(start_northing - end_northing) > 0.1:
+                    # Snap end point to nearest vertex
                     raw_rl = event.ydata - info['y_offset']
                     snapped_e, snapped_rl = self._snap_to_nearest_vertex(
-                        event.xdata, raw_rl, info['group'], info['northing']
+                        event.xdata, raw_rl, info['group'], end_northing
                     )
-                    
-                    self.tie_current_contact_group = info['group']
+
+                    # Add tie line
+                    tie = {
+                        'northing1': start_northing,
+                        'easting1': self.tie_line_start['easting'],
+                        'rl1': self.tie_line_start['rl'],
+                        'northing2': end_northing,
+                        'easting2': snapped_e,
+                        'rl2': snapped_rl,
+                        'auto_suggested': False
+                    }
+
+                    group = self.grouped_contacts[self.tie_current_contact_group]
+                    group.tie_lines.append(tie)
+
+                    # Continue from this point (continuous mode)
                     self.tie_line_start = {
-                        'northing': info['northing'],
+                        'northing': end_northing,
                         'easting': snapped_e,
                         'rl': snapped_rl,
                         'y_offset': info['y_offset']
                     }
-                    self.drawing_tie = True
-                    self.tie_status_label.config(text=f"Drawing tie from N{int(info['northing'])}")
 
-                    # Update listbox selection
-                    group_names = list(self.grouped_contacts.keys())
-                    try:
-                        idx = group_names.index(info['group'])
-                        self.tie_group_listbox.selection_clear(0, tk.END)
-                        self.tie_group_listbox.selection_set(idx)
-                    except ValueError:
-                        pass
+                    self.tie_status_label.config(
+                        text=f"Added tie - continue from N{int(end_northing)}, right-click to stop"
+                    )
+                    self.update_tie_listbox_item()
+                    self.update_tie_summary()
 
-                    self.update_tie_display()
-                else:
-                    # Complete tie
-                    if info['group'] == self.tie_current_contact_group:
-                        start_northing = self.tie_line_start['northing']
-                        end_northing = info['northing']
-
-                        if abs(start_northing - end_northing) > 0.1:
-                            # Snap end point to nearest vertex
-                            raw_rl = event.ydata - info['y_offset']
-                            snapped_e, snapped_rl = self._snap_to_nearest_vertex(
-                                event.xdata, raw_rl, info['group'], end_northing
-                            )
-                            
-                            # Add tie line
-                            tie = {
-                                'northing1': start_northing,
-                                'easting1': self.tie_line_start['easting'],
-                                'rl1': self.tie_line_start['rl'],
-                                'northing2': end_northing,
-                                'easting2': snapped_e,
-                                'rl2': snapped_rl,
-                                'auto_suggested': False
-                            }
-
-                            group = self.grouped_contacts[self.tie_current_contact_group]
-                            group.tie_lines.append(tie)
-
-                            self.tie_status_label.config(text="Added tie line")
-                            self.update_tie_listbox_item()
-                            self.update_tie_summary()
-
-                    self.drawing_tie = False
-                    self.tie_line_start = None
+                    # Clear temp line and redraw
                     if self.temp_tie_line:
                         self.temp_tie_line.remove()
                         self.temp_tie_line = None
                     self.update_tie_display()
-                return
+            return
 
     def on_tie_motion(self, event):
         """Handle mouse motion in tie editor."""
@@ -1323,9 +1366,19 @@ class GeologicalCrossSectionGUI:
             self.canvas_ties.draw()
 
     def on_tie_key(self, event):
-        """Handle key press in tie editor."""
+        """Handle key press in tie editor.
+
+        Keys:
+        - Escape: Cancel current tie
+        - Left/A: Previous section
+        - Right/D: Next section
+        """
         if event.key == 'escape':
             self.cancel_tie()
+        elif event.key in ('left', 'a'):
+            self.tie_prev_section()
+        elif event.key in ('right', 'd'):
+            self.tie_next_section()
 
     def cancel_tie(self):
         """Cancel tie line in progress."""
@@ -1412,25 +1465,29 @@ class GeologicalCrossSectionGUI:
         self.update_tie_display()
 
     def tie_prev_section(self):
-        """Move to previous section in tie editor."""
+        """Move to previous section in tie editor.
+
+        Does NOT cancel tie drawing - allows scrolling while drawing.
+        """
         if self.tie_current_center_section > 0:
             self.tie_current_center_section -= 1
-            # Ensure combo values are populated before setting index
             combo_values = self.tie_section_combo['values']
             if combo_values and self.tie_current_center_section < len(combo_values):
                 self.tie_section_combo.current(self.tie_current_center_section)
-            self.cancel_tie()
+            # Don't cancel tie - allow continuous drawing across sections
             self.update_tie_display()
 
     def tie_next_section(self):
-        """Move to next section in tie editor."""
+        """Move to next section in tie editor.
+
+        Does NOT cancel tie drawing - allows scrolling while drawing.
+        """
         if self.tie_current_center_section < len(self.northings) - 1:
             self.tie_current_center_section += 1
-            # Ensure combo values are populated before setting index
             combo_values = self.tie_section_combo['values']
             if combo_values and self.tie_current_center_section < len(combo_values):
                 self.tie_section_combo.current(self.tie_current_center_section)
-            self.cancel_tie()
+            # Don't cancel tie - allow continuous drawing across sections
             self.update_tie_display()
 
     def tie_auto_suggest(self):
@@ -1965,12 +2022,13 @@ class GeologicalCrossSectionGUI:
                         self.georeferencer.coord_system = coord_system
                         transform = self.georeferencer.build_transformation()
 
-                    # Extract model boundary if we have a transform
+                    # Extract model boundary using coord_system bounds (more accurate than path detection)
                     if transform and coord_system:
                         try:
                             section_northing_val = coord_system.get("northing", 0.0)
                             transform_func = lambda x, y: (transform(x, y)[0], transform(x, y)[2])  # (easting, rl)
-                            model_boundary = extract_model_boundary(
+                            model_boundary = create_model_boundary_from_coord_system(
+                                coord_system=coord_system,
                                 page=page,
                                 transform_func=transform_func,
                                 northing=section_northing_val,
@@ -2099,12 +2157,18 @@ class GeologicalCrossSectionGUI:
                         }
                         
                         # Use new grouped contact extractor
+                        # Build temp model_boundaries dict for this section
+                        temp_model_boundaries = {}
+                        if section_northing_val in self.model_boundaries:
+                            temp_model_boundaries[section_northing] = self.model_boundaries[section_northing_val]
+
                         grouped = extract_contacts_grouped(
                             temp_section_data,
                             sample_distance=2.0,
                             proximity_threshold=10.0,
                             min_contact_length=5.0,
-                            simplify_tolerance=1.0
+                            simplify_tolerance=1.0,
+                            model_boundaries=temp_model_boundaries
                         )
                         
                         # Flatten grouped contacts to list format
@@ -2285,6 +2349,9 @@ class GeologicalCrossSectionGUI:
 
         self.fig_sections.clear()
         self.unit_patches.clear()
+        self.polyline_patches.clear()
+        self.contact_patches.clear()
+        self.contact_node_patches.clear()
 
         if not self.northings:
             self.canvas_sections.draw()
@@ -2513,25 +2580,66 @@ class GeologicalCrossSectionGUI:
                                 x = [vertices[j] for j in range(0, len(vertices), 2)]
                                 z = [vertices[j + 1] for j in range(0, len(vertices), 2)]
 
+                                # Check if contact is selected
+                                is_selected = group_name in self.selected_contacts
+
                                 # Apply transparency based on classification mode
                                 mode = getattr(self, 'classification_mode', 'none')
                                 if mode == 'polygon' or mode == 'fault':
                                     contact_alpha = 0.3
                                     contact_width = 1.5
+                                    contact_color = '#888888'
+                                elif is_selected:
+                                    contact_alpha = 1.0
+                                    contact_width = 4.0
+                                    contact_color = '#FF00FF'  # Magenta for selected
                                 else:
                                     contact_alpha = 0.9
                                     contact_width = 2.5
+                                    contact_color = '#00AA00'  # Green
 
-                                # Draw contact as green dashed line
-                                ax.plot(
+                                # Draw contact line (pickable in contact mode)
+                                contact_line = ax.plot(
                                     x, z,
-                                    color='#00AA00',  # Green
+                                    color=contact_color,
                                     linewidth=contact_width,
                                     linestyle='-',
                                     alpha=contact_alpha,
-                                    zorder=8,  # Below faults but above polygons
-                                    label=f"Contact: {group_name}" if i == 0 else None,
-                                )
+                                    zorder=11 if is_selected else 8,
+                                    picker=8 if mode == 'contact' else False,
+                                )[0]
+
+                                # Store for selection handling
+                                self.contact_patches[contact_line] = {
+                                    "group_name": group_name,
+                                    "formation1": group.formation1,
+                                    "formation2": group.formation2,
+                                    "vertices": vertices,
+                                    "northing": northing,
+                                    "polyline": polyline,
+                                }
+
+                                # Draw nodes when in contact editing mode
+                                if self.contact_editing and (is_selected or mode == 'contact'):
+                                    node_scatter = ax.scatter(
+                                        x, z,
+                                        c='yellow',
+                                        s=40,
+                                        edgecolors='black',
+                                        linewidths=0.5,
+                                        zorder=15,
+                                        picker=5,
+                                    )
+                                    # Store node info for each point
+                                    for node_idx in range(len(x)):
+                                        self.contact_node_patches[id(node_scatter)] = {
+                                            "scatter": node_scatter,
+                                            "group_name": group_name,
+                                            "polyline": polyline,
+                                            "northing": northing,
+                                            "x_coords": x,
+                                            "z_coords": z,
+                                        }
 
             # Draw model boundary if available and enabled
             if self.show_boundaries_var.get() and northing in self.model_boundaries:
@@ -5284,9 +5392,105 @@ class GeologicalCrossSectionGUI:
                     else:
                         self.selected_polylines.add(polyline_name)
                         self.status_var.set(f"Selected: {polyline_name}")
-                    
+
                     self.update_selection_display()
                     self.update_section_display()
+
+        elif event.artist in self.contact_patches:
+            contact_data = self.contact_patches[event.artist]
+            group_name = contact_data.get("group_name", "Unknown")
+            formation1 = contact_data.get("formation1", "")
+            formation2 = contact_data.get("formation2", "")
+            contact_display = f"{formation1}-{formation2}" if formation1 and formation2 else group_name
+
+            # Right-click could be used for future contact operations
+            if is_right_click:
+                self.status_var.set(f"Contact: {contact_display}")
+                return
+
+            # Check classification mode
+            if self.classification_mode != "contact":
+                self.status_var.set(f"Contact: {contact_display} (Switch to Contact mode to interact)")
+                return
+
+            # Contact mode - toggle selection
+            if group_name in self.selected_contacts:
+                self.selected_contacts.discard(group_name)
+                self.status_var.set(f"Deselected contact: {contact_display}")
+            else:
+                self.selected_contacts.add(group_name)
+                self.status_var.set(f"Selected contact: {contact_display}")
+
+            self.update_selection_display()
+            self.update_section_display()
+
+        # Check if clicked on a contact node (for deletion)
+        elif self.contact_editing and hasattr(event.artist, 'get_offsets'):
+            # This is a scatter plot (contact nodes)
+            artist_id = id(event.artist)
+            if artist_id in self.contact_node_patches:
+                node_data = self.contact_node_patches[artist_id]
+
+                # Get the clicked point index
+                if hasattr(event, 'ind') and len(event.ind) > 0:
+                    clicked_idx = event.ind[0]
+
+                    # Right-click deletes the node
+                    if is_right_click:
+                        self._delete_contact_node(node_data, clicked_idx)
+                    else:
+                        # Left-click just shows info
+                        x = node_data['x_coords'][clicked_idx]
+                        z = node_data['z_coords'][clicked_idx]
+                        self.status_var.set(
+                            f"Contact node {clicked_idx+1}/{len(node_data['x_coords'])} "
+                            f"at ({x:.1f}, {z:.1f}) - Right-click to delete"
+                        )
+
+    def _delete_contact_node(self, node_data, node_idx):
+        """Delete a node from a contact polyline."""
+        polyline = node_data['polyline']
+        group_name = node_data['group_name']
+        x_coords = node_data['x_coords']
+
+        # Need at least 2 points for a valid line
+        if len(x_coords) <= 2:
+            self.status_var.set("Cannot delete - contact needs at least 2 points")
+            return
+
+        # Get the vertices list from polyline
+        vertices = list(polyline.vertices)
+
+        # Each point is 2 values (x, y), so index is node_idx * 2
+        vert_idx = node_idx * 2
+
+        if vert_idx + 1 < len(vertices):
+            # Remove the x and y values
+            del vertices[vert_idx:vert_idx + 2]
+
+            # Update the polyline
+            polyline.vertices = vertices
+
+            # Update pdf_vertices too if they exist
+            if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+                pdf_verts = list(polyline.pdf_vertices)
+                if vert_idx + 1 < len(pdf_verts):
+                    del pdf_verts[vert_idx:vert_idx + 2]
+                    polyline.pdf_vertices = pdf_verts
+
+            self.status_var.set(f"Deleted node {node_idx+1} from {group_name}")
+
+            # Refresh display
+            self.update_section_display()
+
+    def toggle_contact_editing(self):
+        """Toggle contact node editing mode."""
+        self.contact_editing = not self.contact_editing
+        if self.contact_editing:
+            self.status_var.set("Contact editing ON - right-click nodes to delete")
+        else:
+            self.status_var.set("Contact editing OFF")
+        self.update_section_display()
 
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""
@@ -5340,15 +5544,27 @@ class GeologicalCrossSectionGUI:
                 pass
         
         if found_feature:
-            # Build tooltip text
-            name = found_feature.get('name', 'Unknown')
-            assignment = found_feature.get('assignment') or found_feature.get('fault_assignment')
-            display = found_feature.get('display_name', name)
-            
-            if assignment:
-                tooltip_text = f"{display}\n({name})"
+            # Build tooltip text based on feature type
+            feature_type = found_feature.get('_feature_type', 'unknown')
+
+            if feature_type == 'contact':
+                group_name = found_feature.get('group_name', 'Unknown')
+                formation1 = found_feature.get('formation1', '')
+                formation2 = found_feature.get('formation2', '')
+                northing = found_feature.get('northing', 0)
+                if formation1 and formation2:
+                    tooltip_text = f"Contact: {formation1}-{formation2}\nSection: N{int(northing)}"
+                else:
+                    tooltip_text = f"Contact: {group_name}\nSection: N{int(northing)}"
             else:
-                tooltip_text = f"{name}\n(Unassigned)"
+                name = found_feature.get('name', 'Unknown')
+                assignment = found_feature.get('assignment') or found_feature.get('fault_assignment')
+                display = found_feature.get('display_name', name)
+
+                if assignment:
+                    tooltip_text = f"{display}\n({name})"
+                else:
+                    tooltip_text = f"{name}\n(Unassigned)"
             
             # Always recreate annotation on hover (avoids axes mismatch issues)
             # Hide old one first
@@ -5640,23 +5856,55 @@ class GeologicalCrossSectionGUI:
         self.update_3d_view()
 
     def select_similar(self):
-        """Select units with similar properties."""
-        if not self.selected_units:
-            messagebox.showinfo("No Selection", "Please select at least one unit first")
-            return
+        """Select units/contacts with similar properties based on current mode."""
+        mode = getattr(self, 'classification_mode', 'none')
 
-        selected_formations = set()
-        for unit_name in self.selected_units:
-            if unit_name in self.all_geological_units:
-                unit = self.all_geological_units[unit_name]
-                selected_formations.add(unit.get("formation", "UNIT"))
+        # Contact mode - select all contacts with same formation pair
+        if mode == 'contact':
+            if not self.selected_contacts:
+                messagebox.showinfo("No Selection", "Please select at least one contact first")
+                return
 
-        new_selections = set()
-        for unit_name, unit in self.all_geological_units.items():
-            if unit.get("formation", "UNIT") in selected_formations:
-                new_selections.add(unit_name)
+            # Get formation pairs from selected contacts
+            selected_pairs = set()
+            for group_name in self.selected_contacts:
+                if group_name in self.grouped_contacts:
+                    group = self.grouped_contacts[group_name]
+                    pair = (group.formation1, group.formation2)
+                    selected_pairs.add(pair)
+                    # Also add reverse pair since contacts are bidirectional
+                    selected_pairs.add((group.formation2, group.formation1))
 
-        self.selected_units = new_selections
+            # Select all contacts with matching formation pairs
+            new_selections = set()
+            for group_name, group in self.grouped_contacts.items():
+                pair = (group.formation1, group.formation2)
+                if pair in selected_pairs:
+                    new_selections.add(group_name)
+
+            self.selected_contacts = new_selections
+            count = len(new_selections)
+            self.status_var.set(f"Selected {count} contact groups with similar formations")
+
+        # Polygon mode - existing behavior
+        else:
+            if not self.selected_units:
+                messagebox.showinfo("No Selection", "Please select at least one unit first")
+                return
+
+            selected_formations = set()
+            for unit_name in self.selected_units:
+                if unit_name in self.all_geological_units:
+                    unit = self.all_geological_units[unit_name]
+                    selected_formations.add(unit.get("formation", "UNIT"))
+
+            new_selections = set()
+            for unit_name, unit in self.all_geological_units.items():
+                if unit.get("formation", "UNIT") in selected_formations:
+                    new_selections.add(unit_name)
+
+            self.selected_units = new_selections
+
         self.update_selection_display()
         self.update_section_display()
         self.update_3d_view()
