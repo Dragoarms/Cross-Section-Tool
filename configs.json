@@ -1,0 +1,198 @@
+{
+  "version": 2,
+  "prospects": [
+    {
+      "name": "OKOUME",
+      "order": 1,
+      "color": null,
+      "expanded": true,
+      "description": ""
+    },
+    {
+      "name": "KOMBO MOMBO",
+      "order": 0,
+      "color": null,
+      "expanded": true,
+      "description": ""
+    },
+    {
+      "name": "Default",
+      "order": 2,
+      "color": null,
+      "expanded": true,
+      "description": ""
+    }
+  ],
+  "units": [
+    {
+      "name": "NDASSA PHYLLITE",
+      "color": [
+        0.8588235294117647,
+        0.6431372549019608,
+        0.1411764705882353
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 5,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 250.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "SEKI BIF",
+      "color": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 6,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 600.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "NZEBI PHYLLITE",
+      "color": [
+        0.9372549019607843,
+        0.8588235294117647,
+        0.3137254901960784
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 3,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 60.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "TEKE BIF",
+      "color": [
+        0.5019607843137255,
+        1.0,
+        1.0
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 4,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 45.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "OKANDE BIF",
+      "color": [
+        0.0,
+        1.0,
+        1.0
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 2,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 150.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "FANG PHYLLITE",
+      "color": [
+        0.8235294117647058,
+        0.7607843137254902,
+        0.5411764705882353
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 1,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 100.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "KOTA BIF",
+      "color": [
+        0.0,
+        0.5019607843137255,
+        1.0
+      ],
+      "prospect": "KOMBO MOMBO",
+      "age": "Unknown",
+      "order": 0,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": 300.0,
+      "pattern": null,
+      "description": ""
+    },
+    {
+      "name": "VILI GW/MUDSTONE",
+      "color": [
+        0.5019607843137255,
+        0.5019607843137255,
+        0.5019607843137255
+      ],
+      "prospect": "Default",
+      "age": "Unknown",
+      "order": 0,
+      "is_unconformity": false,
+      "can_pinch_out": true,
+      "thickness": null,
+      "pattern": null,
+      "description": ""
+    }
+  ],
+  "faults": [
+    {
+      "name": "F1",
+      "fault_type": "normal",
+      "color": "#ff00ff",
+      "timing": 1,
+      "prospect": null,
+      "description": ""
+    },
+    {
+      "name": "F2",
+      "fault_type": "normal",
+      "color": "#0000FF",
+      "timing": 2,
+      "prospect": null,
+      "description": ""
+    },
+    {
+      "name": "F3",
+      "fault_type": "normal",
+      "color": "#00AA00",
+      "timing": 3,
+      "prospect": null,
+      "description": ""
+    },
+    {
+      "name": "F4",
+      "fault_type": "normal",
+      "color": "#FF8800",
+      "timing": 4,
+      "prospect": null,
+      "description": ""
+    },
+    {
+      "name": "F5",
+      "fault_type": "normal",
+      "color": "#8800FF",
+      "timing": 5,
+      "prospect": null,
+      "description": ""
+    }
+  ]
+}

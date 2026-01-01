@@ -1,0 +1,18 @@
+# Core dependencies
+PyMuPDF>=1.23.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+shapely>=2.0.0
+rasterio>=1.3.0
+
+# Testing dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+#  Optional 3d interpolation between sections
+scipy>=1.11.0
+
+# Optional dependencies for development
+black>=22.0.0
+flake8>=5.0.0
+mypy>=1.0.0
