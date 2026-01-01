@@ -495,59 +495,92 @@ def _sort_points_nearest_neighbor(
     return result
 
 
-def _get_overall_trend(polyline: List[Tuple[float, float]], num_points: int = 5) -> Tuple[float, float]:
+def _is_near_boundary_edge(
+    point: Tuple[float, float],
+    polyline: List[Tuple[float, float]],
+    edge_threshold_ratio: float = 0.05
+) -> bool:
     """
-    Get the overall trend direction of a polyline using multiple points.
-    Returns a normalized direction vector.
+    Check if a point is near the boundary edge of the polyline's extent.
+
+    A point at the "edge" is within edge_threshold_ratio of the min/max extent.
+    This helps identify if a hook is at a natural termination point.
     """
     if len(polyline) < 2:
-        return (1.0, 0.0)
+        return True
 
-    # Use first and last few points to determine overall trend
-    n = min(num_points, len(polyline) // 3)
-    n = max(n, 1)
+    x_coords = [p[0] for p in polyline]
+    y_coords = [p[1] for p in polyline]
 
-    start_pt = polyline[0]
-    end_pt = polyline[-1]
+    x_min, x_max = min(x_coords), max(x_coords)
+    y_min, y_max = min(y_coords), max(y_coords)
 
-    # If polyline is long enough, average the start and end regions
-    if len(polyline) > 6:
-        start_x = sum(p[0] for p in polyline[:n]) / n
-        start_y = sum(p[1] for p in polyline[:n]) / n
-        end_x = sum(p[0] for p in polyline[-n:]) / n
-        end_y = sum(p[1] for p in polyline[-n:]) / n
-        trend = (end_x - start_x, end_y - start_y)
-    else:
-        trend = _vector_subtract(end_pt, start_pt)
+    x_range = x_max - x_min
+    y_range = y_max - y_min
 
-    length = _vector_length(trend)
-    if length > 0.001:
-        return (trend[0] / length, trend[1] / length)
-    return (1.0, 0.0)
+    # Check if point is near any edge
+    x_threshold = x_range * edge_threshold_ratio
+    y_threshold = y_range * edge_threshold_ratio
+
+    near_x_edge = (point[0] < x_min + x_threshold) or (point[0] > x_max - x_threshold)
+    near_y_edge = (point[1] < y_min + y_threshold) or (point[1] > y_max - y_threshold)
+
+    return near_x_edge or near_y_edge
+
+
+def _get_continuation_length(
+    polyline: List[Tuple[float, float]],
+    from_index: int,
+    direction: str = "forward"
+) -> float:
+    """
+    Calculate the total length of polyline continuing from a given index.
+
+    Args:
+        polyline: List of points
+        from_index: Index to start measuring from
+        direction: "forward" (toward end) or "backward" (toward start)
+
+    Returns:
+        Total length of the continuation
+    """
+    total_length = 0.0
+
+    if direction == "forward":
+        for i in range(from_index, len(polyline) - 1):
+            total_length += _point_distance(polyline[i], polyline[i + 1])
+    else:  # backward
+        for i in range(from_index, 0, -1):
+            total_length += _point_distance(polyline[i], polyline[i - 1])
+
+    return total_length
 
 
 def _detect_and_trim_hooks(
     polyline: List[Tuple[float, float]],
-    reversal_angle: float = 140.0,  # Increased from 120 - more conservative
-    max_hook_length: float = 15.0,  # Reduced from 20 - only remove very short hooks
-    min_points_remaining: int = 5
+    reversal_angle: float = 140.0,
+    max_hook_length: float = 20.0,
+    min_points_remaining: int = 5,
+    model_boundary=None
 ) -> List[Tuple[float, float]]:
     """
     Detect and remove true hooks at both ends of a polyline.
 
     A hook is defined as a SHORT terminal segment that:
-    1. REVERSES direction relative to the adjacent segment
-    2. Goes AGAINST the overall polyline trend
-    3. Is short relative to the total polyline extent
+    1. REVERSES direction sharply (angle > reversal_angle)
+    2. Is near a natural termination point (boundary edge)
+    3. Does NOT have significant polyline continuation after it
 
-    This conservative approach preserves legitimate fold limbs while
-    removing only obvious terminal artifacts.
+    For folded contacts, even if there's a sharp reversal, if there's
+    significant continuation after the reversal point, it's preserved
+    as it's likely a fold limb, not an artifact.
 
     Args:
         polyline: List of (x, y) coordinates
         reversal_angle: Angle (degrees) between segments that indicates reversal
         max_hook_length: Maximum length of segment to consider as a hook
         min_points_remaining: Minimum points to keep in polyline
+        model_boundary: Optional boundary for termination point checking
 
     Returns:
         Cleaned polyline with hooks removed
@@ -556,88 +589,96 @@ def _detect_and_trim_hooks(
         return polyline
 
     result = list(polyline)
+
+    # Calculate total polyline length for comparisons
+    total_length = sum(
+        _point_distance(polyline[i], polyline[i+1])
+        for i in range(len(polyline) - 1)
+    )
+
+    # Very short polylines - don't trim at all
+    if total_length < max_hook_length * 3:
+        return polyline
+
+    # Check start for hooks
     start_trimmed = 0
-    end_trimmed = 0
+    max_start_trim = min(3, len(result) - min_points_remaining)
 
-    # Calculate total polyline extent for relative comparisons
-    total_extent_x = max(p[0] for p in polyline) - min(p[0] for p in polyline)
-    total_extent_y = max(p[1] for p in polyline) - min(p[1] for p in polyline)
-    total_extent = max(total_extent_x, total_extent_y)
-
-    # Make max_hook_length relative to polyline extent (max 5% of extent)
-    relative_max_length = min(max_hook_length, total_extent * 0.05)
-
-    # Get overall trend direction
-    overall_trend = _get_overall_trend(polyline)
-
-    # Trim hooks from start - but be very conservative
-    trim_iterations = 0
-    max_trim_iterations = 3  # Limit how much we trim
-
-    while len(result) > min_points_remaining and trim_iterations < max_trim_iterations:
+    while start_trimmed < max_start_trim and len(result) > min_points_remaining:
         if len(result) < 4:
             break
 
-        # First segment (from point 0 to point 1)
+        # First segment
         seg1 = _vector_subtract(result[1], result[0])
         seg1_len = _vector_length(seg1)
 
-        # Second segment (from point 1 to point 2)
+        # Second segment
         seg2 = _vector_subtract(result[2], result[1])
 
         angle = _angle_between_vectors(seg1, seg2)
 
-        # Normalize first segment for trend comparison
-        if seg1_len > 0.001:
-            seg1_norm = (seg1[0] / seg1_len, seg1[1] / seg1_len)
-            # Check if first segment goes AGAINST overall trend
-            trend_dot = seg1_norm[0] * overall_trend[0] + seg1_norm[1] * overall_trend[1]
-            against_trend = trend_dot < -0.3  # Going backwards relative to overall trend
-        else:
-            against_trend = False
+        # Check if this looks like a hook
+        if angle > reversal_angle and seg1_len < max_hook_length:
+            # Calculate continuation length after the reversal
+            continuation = _get_continuation_length(result, 1, "forward")
 
-        # Only trim if segment is short, reverses, AND goes against trend
-        if angle > reversal_angle and seg1_len < relative_max_length and against_trend:
-            logger.debug(f"Trimming start hook: angle={angle:.1f}°, length={seg1_len:.1f}m, against_trend={against_trend}")
-            result.pop(0)
-            start_trimmed += 1
-            trim_iterations += 1
+            # Check if start point is near boundary edge
+            near_edge = _is_near_boundary_edge(result[0], polyline, 0.1)
+
+            # Only trim if:
+            # 1. Near edge (natural termination point), OR
+            # 2. Very short hook with substantial continuation
+            # But NEVER trim if continuation after reversal is significant
+            # (indicates a fold limb, not an artifact)
+
+            hook_to_continuation_ratio = seg1_len / continuation if continuation > 0 else float('inf')
+
+            # If the "hook" segment is less than 5% of the continuation,
+            # and near edge, it's probably an artifact
+            if near_edge and hook_to_continuation_ratio < 0.05:
+                logger.debug(f"Trimming start hook: angle={angle:.1f}°, len={seg1_len:.1f}m, ratio={hook_to_continuation_ratio:.3f}")
+                result.pop(0)
+                start_trimmed += 1
+            else:
+                # Not a hook - it's either a fold limb or has significant geometry
+                break
         else:
             break
 
-    # Trim hooks from end - same conservative approach
-    trim_iterations = 0
+    # Check end for hooks
+    end_trimmed = 0
+    max_end_trim = min(3, len(result) - min_points_remaining)
 
-    while len(result) > min_points_remaining and trim_iterations < max_trim_iterations:
+    while end_trimmed < max_end_trim and len(result) > min_points_remaining:
         if len(result) < 4:
             break
 
         n = len(result)
 
-        # Last segment (from point n-2 to point n-1)
+        # Last segment
         seg_last = _vector_subtract(result[n-1], result[n-2])
         seg_last_len = _vector_length(seg_last)
 
-        # Second-to-last segment (from point n-3 to point n-2)
+        # Second-to-last segment
         seg_prev = _vector_subtract(result[n-2], result[n-3])
 
         angle = _angle_between_vectors(seg_prev, seg_last)
 
-        # Normalize last segment for trend comparison
-        if seg_last_len > 0.001:
-            seg_last_norm = (seg_last[0] / seg_last_len, seg_last[1] / seg_last_len)
-            # Check if last segment goes AGAINST overall trend (should continue forward)
-            trend_dot = seg_last_norm[0] * overall_trend[0] + seg_last_norm[1] * overall_trend[1]
-            against_trend = trend_dot < -0.3
-        else:
-            against_trend = False
+        if angle > reversal_angle and seg_last_len < max_hook_length:
+            # Calculate continuation length before the reversal
+            continuation = _get_continuation_length(result, n-2, "backward")
 
-        # Only trim if segment is short, reverses, AND goes against trend
-        if angle > reversal_angle and seg_last_len < relative_max_length and against_trend:
-            logger.debug(f"Trimming end hook: angle={angle:.1f}°, length={seg_last_len:.1f}m, against_trend={against_trend}")
-            result.pop()
-            end_trimmed += 1
-            trim_iterations += 1
+            # Check if end point is near boundary edge
+            near_edge = _is_near_boundary_edge(result[-1], polyline, 0.1)
+
+            hook_to_continuation_ratio = seg_last_len / continuation if continuation > 0 else float('inf')
+
+            if near_edge and hook_to_continuation_ratio < 0.05:
+                logger.debug(f"Trimming end hook: angle={angle:.1f}°, len={seg_last_len:.1f}m, ratio={hook_to_continuation_ratio:.3f}")
+                result.pop()
+                end_trimmed += 1
+            else:
+                break
         else:
             break
 
