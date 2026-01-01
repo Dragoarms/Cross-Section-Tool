@@ -39,7 +39,7 @@ from .strat_column_v2 import StratColumnV2, StratUnit, Prospect, Fault, FaultTyp
 from .auto_labeler import AutoLabeler
 from .batch_processor import BatchProcessor
 from .section_correlation import SectionCorrelator
-from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibration_dialog
+from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibration_dialog, open_annotation_filter_dialog
 from .contact_extraction import ContactExtractor, GroupedContact, extract_contacts_grouped
 from .tie_line_editor import TieLineEditor, open_tie_line_editor
 from .pdf_annotation_writer import PDFAnnotationWriter, write_assignments_batch
@@ -430,7 +430,8 @@ class GeologicalCrossSectionGUI:
         # WORKFLOW BUTTONS - Step 2: Process
         process_frame = ttk.LabelFrame(control_panel, text="2. Process", padding=3)
         process_frame.pack(side=tk.LEFT, padx=3)
-        ttk.Button(process_frame, text=" Process All", command=self.process_all, width=11).pack(side=tk.LEFT, padx=2)
+        ttk.Button(process_frame, text="Filter...", command=self.open_annotation_filter, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Button(process_frame, text="Process All", command=self.process_all, width=11).pack(side=tk.LEFT, padx=2)
 
         # WORKFLOW BUTTONS - Step 3: Contacts
         contacts_frame = ttk.LabelFrame(control_panel, text="3. Contacts", padding=3)
@@ -1214,6 +1215,9 @@ class GeologicalCrossSectionGUI:
 
         # Check if clicked on a contact
         for line, info in self.tie_contact_lines.items():
+            # Skip lines without a figure to avoid matplotlib warnings
+            if line.figure is None:
+                continue
             contains, _ = line.contains(event)
             if contains:
                 if not self.drawing_tie:
@@ -1832,6 +1836,64 @@ class GeologicalCrossSectionGUI:
                 logger.error(f"Failed to open PDF: {e}")
                 messagebox.showerror("Error", f"Failed to open PDF: {str(e)}")
 
+    def open_annotation_filter(self):
+        """Open the annotation group filter dialog to select which groups to include."""
+        if not self.pdf_list:
+            messagebox.showwarning("Warning", "Please open PDF files first")
+            return
+
+        try:
+            self.status_var.set("Scanning annotation groups...")
+            self.root.update()
+
+            # Scan all loaded PDFs for annotation groups
+            all_groups = {}
+            for pdf_path in self.pdf_list:
+                doc = fitz.open(str(pdf_path))
+                groups = FeatureExtractor.scan_all_pages(doc)
+                doc.close()
+
+                # Merge groups
+                for name, info in groups.items():
+                    if name in all_groups:
+                        all_groups[name]['count'] += info['count']
+                        all_groups[name]['types'].update(info['types'])
+                        all_groups[name]['pages'].update(info.get('pages', set()))
+                        all_groups[name]['sample_colors'].extend(info['sample_colors'][:3])
+                    else:
+                        all_groups[name] = info
+
+            if not all_groups:
+                messagebox.showinfo("Info", "No annotation groups found in PDFs")
+                return
+
+            self.status_var.set(f"Found {len(all_groups)} annotation groups")
+
+            # Open dialog
+            included, excluded, cancelled = open_annotation_filter_dialog(
+                self.root,
+                all_groups,
+                self.feature_extractor.included_groups,
+                self.feature_extractor.excluded_groups
+            )
+
+            if not cancelled:
+                # Apply filter to feature extractor
+                self.feature_extractor.set_group_filter(included=included, excluded=excluded)
+
+                # Count selected groups
+                selected_count = len(included) if included else len(all_groups) - len(excluded or set())
+                self.status_var.set(f"Filter applied: {selected_count}/{len(all_groups)} groups selected")
+
+                logger.info(f"Annotation filter applied: {selected_count} groups included")
+            else:
+                self.status_var.set("Filter cancelled")
+
+        except Exception as e:
+            logger.error(f"Error opening annotation filter: {e}")
+            messagebox.showerror("Error", f"Failed to scan annotations: {str(e)}")
+            self.status_var.set("Filter error")
+
     def process_all(self):
         """Process all pages of all loaded PDFs."""
         if not self.pdf_list:
@@ -2241,6 +2303,26 @@ class GeologicalCrossSectionGUI:
                     easting_max = section_data.get("easting_max", self.global_easting_max)
                     rl_min = section_data.get("rl_min", self.global_rl_min)
                     rl_max = section_data.get("rl_max", self.global_rl_max)
+
+                    # Get PDF coordinate bounds to crop to the coordinate system area
+                    coord_system = section_data.get("coord_system", {})
+                    pdf_x_min = coord_system.get("pdf_x_min")
+                    pdf_x_max = coord_system.get("pdf_x_max")
+                    pdf_y_min = coord_system.get("pdf_y_min")
+                    pdf_y_max = coord_system.get("pdf_y_max")
+
+                    # Crop image to coordinate area if bounds are available
+                    if all(v is not None for v in [pdf_x_min, pdf_x_max, pdf_y_min, pdf_y_max]):
+                        # Convert PDF coordinates to pixel indices
+                        # PDF y-axis is typically inverted (0 at top)
+                        x_start = max(0, int(pdf_x_min))
+                        x_end = min(img.shape[1], int(pdf_x_max))
+                        y_start = max(0, int(pdf_y_min))
+                        y_end = min(img.shape[0], int(pdf_y_max))
+
+                        # Ensure valid crop region
+                        if x_end > x_start and y_end > y_start:
+                            img = img[y_start:y_end, x_start:x_end]
 
                     # Display with correct extent
                     ax.imshow(
@@ -5119,7 +5201,9 @@ class GeologicalCrossSectionGUI:
         if not found_feature:
             try:
                 for line, data in self.polyline_patches.items():
-                    if line.contains(event)[0]:
+                    # Check if line has a figure before calling contains()
+                    # This prevents "no figure set when check if mouse is on line" warnings
+                    if line.figure is not None and line.contains(event)[0]:
                         found_feature = data
                         break
             except:
