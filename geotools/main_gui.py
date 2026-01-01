@@ -2245,6 +2245,26 @@ class GeologicalCrossSectionGUI:
                     rl_min = section_data.get("rl_min", self.global_rl_min)
                     rl_max = section_data.get("rl_max", self.global_rl_max)
 
+                    # Get PDF coordinate bounds to crop to the coordinate system area
+                    coord_system = section_data.get("coord_system", {})
+                    pdf_x_min = coord_system.get("pdf_x_min")
+                    pdf_x_max = coord_system.get("pdf_x_max")
+                    pdf_y_min = coord_system.get("pdf_y_min")
+                    pdf_y_max = coord_system.get("pdf_y_max")
+
+                    # Crop image to coordinate area if bounds are available
+                    if all(v is not None for v in [pdf_x_min, pdf_x_max, pdf_y_min, pdf_y_max]):
+                        # Convert PDF coordinates to pixel indices
+                        # PDF y-axis is typically inverted (0 at top)
+                        x_start = max(0, int(pdf_x_min))
+                        x_end = min(img.shape[1], int(pdf_x_max))
+                        y_start = max(0, int(pdf_y_min))
+                        y_end = min(img.shape[0], int(pdf_y_max))
+
+                        # Ensure valid crop region
+                        if x_end > x_start and y_end > y_start:
+                            img = img[y_start:y_end, x_start:x_end]
+
                     # Display with correct extent
                     ax.imshow(
                         img,

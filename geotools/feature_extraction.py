@@ -63,7 +63,7 @@ class FeatureExtractor:
     def _is_colored_polygon(self, color) -> Tuple[bool, str]:
         """
         Check if color qualifies as a 'colored' polygon (not grayscale).
-        
+
         Returns:
             (is_colored, reason)
         """
@@ -80,7 +80,7 @@ class FeatureExtractor:
         if r > 0.9 and g > 0.9 and b > 0.9:
             return False, "White"
 
-        # Reject grayscale (R â‰ˆ G â‰ˆ B)
+        # Reject grayscale (R ≈ G ≈ B)
         tolerance = 0.15
         if abs(r - g) < tolerance and abs(g - b) < tolerance and abs(r - b) < tolerance:
             return False, f"Grayscale (R={r:.2f}, G={g:.2f}, B={b:.2f})"
@@ -89,69 +89,25 @@ class FeatureExtractor:
 
     def _is_fault_line(self, annot) -> Tuple[bool, str]:
         """
-        Check if an annotation is a fault line.
-
-        Checks subject, title, author, and content fields for:
-        - 'fault' keyword (case insensitive)
-        - Shortened versions like 'F1', 'F2', 'F10', etc.
-
-        IMPORTANT: Subject field is prioritized for the fault NAME.
-        Other fields are only used to detect if it's a fault, but subject
-        is always preferred as the identifier.
+        Check if an annotation is a fault line (subject contains 'Fault').
 
         Returns:
             (is_fault, fault_name)
         """
-        import re
-
         if not hasattr(annot, 'info'):
             return False, ""
 
         info = annot.info
+        subject = info.get('subject', '') or info.get('content', '') or ''
 
-        # Get all field values
-        subject = (info.get('subject', '') or '').strip()
-        title = (info.get('title', '') or '').strip()
-        author = (info.get('author', '') or '').strip()
-        content = (info.get('content', '') or '').strip()
+        # Check if subject contains 'Fault' (case insensitive)
+        subject_lower = subject.lower().strip()
+        if 'fault' in subject_lower:
+            # Extract fault name
+            fault_name = subject.strip() if subject.strip() else "Fault"
+            return True, fault_name
 
-        # Pattern for fault: "fault" or "F" followed by number (F1, F2, F10, etc.)
-        fault_pattern = re.compile(r'\bfault\b|^f\d+$|^f\s*\d+$|\bf\d+\b', re.IGNORECASE)
-
-        # Check if ANY field indicates this is a fault
-        is_fault = False
-        for field_value in [subject, title, author, content]:
-            if field_value and fault_pattern.search(field_value):
-                is_fault = True
-                break
-
-        if not is_fault:
-            return False, ""
-
-        # PRIORITIZE subject for the fault name
-        # Only fall back to other fields if subject is empty or doesn't match pattern
-        if subject and fault_pattern.search(subject):
-            fault_name = subject
-            logger.debug(f"Fault detected, using subject as name: '{fault_name}'")
-        elif subject:
-            # Subject exists but doesn't match pattern - still use it as name
-            fault_name = subject
-            logger.debug(f"Fault detected, using subject (non-pattern) as name: '{fault_name}'")
-        elif title and fault_pattern.search(title):
-            fault_name = title
-            logger.debug(f"Fault detected, using title as name: '{fault_name}'")
-        elif author and fault_pattern.search(author):
-            fault_name = author
-            logger.debug(f"Fault detected, using author as name: '{fault_name}'")
-        elif content and fault_pattern.search(content):
-            fault_name = content
-            logger.debug(f"Fault detected, using content as name: '{fault_name}'")
-        else:
-            # Fallback - use first non-empty field
-            fault_name = subject or title or author or content or "Fault"
-            logger.debug(f"Fault detected, using fallback name: '{fault_name}'")
-
-        return True, fault_name
+        return False, ""
 
     def _get_author_from_annot(self, annot) -> Optional[str]:
         """Get author/title from annotation metadata."""
@@ -168,12 +124,12 @@ class FeatureExtractor:
     def extract_annotations(self, page) -> List[Dict]:
         """
         Extract annotations from PDF page.
-        
+
         Filtering rules:
         - ONLY extract items that have an 'author' tag (title/author metadata)
         - Lines/PolyLines: Extract if has author tag, classify as Fault if subject contains 'Fault'
         - Polygons: Extract if has author tag (including grayscale if has author)
-        
+
         Returns:
             List of annotation dictionaries (polygons + faults combined for backward compatibility)
             Faults are also stored separately in self.faults
@@ -192,20 +148,19 @@ class FeatureExtractor:
 
             for annot in page.annots():
                 annot_type = annot.type[0]
-                
+
                 # CRITICAL: Only extract items with author tag
                 has_author = self._has_author_tag(annot)
                 author = self._get_author_from_annot(annot)
-                
+
                 if not has_author:
                     skipped_no_author += 1
                     logger.debug(f"Skipped annotation - no author tag")
                     continue
-                
-                # Check if this is a line/polyline (types 3, 9, 15)
-                # Type 3 = Line, Type 9 = PolyLine, Type 15 = Ink (pencil/freehand)
-                is_line_type = annot_type in [3, 9, 15]
-                
+
+                # Check if this is a line/polyline (types 3, 9)
+                is_line_type = annot_type in [3, 9]  # Line, PolyLine
+
                 # Check if this is a polygon type (types 4, 5, 6, 10)
                 is_polygon_type = annot_type in [4, 5, 6, 10]  # Square, Circle, Highlight, Polygon
 
@@ -217,7 +172,7 @@ class FeatureExtractor:
                     vertices = self._extract_vertices(annot)
                     if vertices and len(vertices) >= 4:
                         color = self._get_color(annot) or (1.0, 0.0, 0.0)  # Default red for lines
-                        
+
                         if is_fault:
                             # This is a fault line
                             fault_data = {
@@ -254,10 +209,10 @@ class FeatureExtractor:
                 elif is_polygon_type:
                     # Polygons with author tag - extract regardless of color (grayscale OK)
                     vertices = self._extract_vertices(annot)
-                    
+
                     if vertices and len(vertices) >= 6:
                         color = self._get_color(annot) or (0.5, 0.5, 0.5)  # Default gray
-                        
+
                         if is_fault:
                             # Fault polygon
                             fault_data = {
@@ -280,10 +235,10 @@ class FeatureExtractor:
                             # If formation couldn't be determined from subject, use author
                             if formation == "UNIT" and author:
                                 formation = author.strip().upper()
-                            
+
                             # Check for saved assignment from previous session
                             saved_assignment = self._get_saved_assignment(annot)
-                            
+
                             polygon_data = {
                                 "type": "Polygon",
                                 "vertices": vertices,
@@ -324,79 +279,79 @@ class FeatureExtractor:
     def _extract_from_drawings(self, page) -> Tuple[List[Dict], List[Dict]]:
         """
         Extract geological features from PDF drawings (vector graphics).
-        
+
         Only extracts:
         - Colored filled polygons (geological units)
         - Does NOT extract lines from drawings (only annotation-based faults with 'Fault' subject)
-        
+
         Returns:
             (polygons, faults) tuple
         """
         polygons = []
         faults = []  # Currently empty - faults only from annotations with proper subject
-        
+
         try:
             drawings = page.get_drawings()
             logger.debug(f"Found {len(drawings)} drawings on page")
-            
+
             skipped_grayscale = 0
             skipped_unfilled = 0
             skipped_small = 0
-            
+
             for drawing in drawings:
                 if "items" not in drawing:
                     continue
-                
+
                 # Get fill color - we only want FILLED colored shapes
                 fill_color = drawing.get("fill")
                 stroke_color = drawing.get("color") or drawing.get("stroke")
-                
+
                 # Prefer fill color for polygons
                 color = fill_color or stroke_color
-                
+
                 if not color:
                     continue
-                
+
                 # Convert to tuple if needed
                 if hasattr(color, '__iter__') and len(color) >= 3:
                     color = tuple(color[:3])
                 else:
                     continue
-                
+
                 # Check if colored
                 is_colored, reason = self._is_colored_polygon(color)
                 if not is_colored:
                     skipped_grayscale += 1
                     continue
-                
+
                 # Check if filled (filled shapes are more likely geological units)
                 has_fill = fill_color is not None
                 is_closed = drawing.get("closePath", False)
-                
+
                 # Build vertices from drawing items
                 vertices = []
                 items = drawing["items"]
-                
+
                 for item in items:
                     item_type = item[0]
-                    
+
                     if item_type == "l":  # Line segment
                         start_pt = item[1]
                         end_pt = item[2]
-                        
+
                         if not vertices:
                             vertices.extend([start_pt.x, start_pt.y])
                         vertices.extend([end_pt.x, end_pt.y])
-                        
+
                     elif item_type == "c":  # Cubic bezier
                         if len(item) >= 5:
                             p0 = item[1]
                             p3 = item[4]
-                            
+
                             if not vertices:
                                 vertices.extend([p0.x, p0.y])
                             vertices.extend([p3.x, p3.y])
-                                
+
                     elif item_type == "re":  # Rectangle
                         rect = item[1]
                         vertices.extend([rect.x0, rect.y0])
@@ -404,20 +359,20 @@ class FeatureExtractor:
                         vertices.extend([rect.x1, rect.y1])
                         vertices.extend([rect.x0, rect.y1])
                         vertices.extend([rect.x0, rect.y0])
-                
+
                 # Must have at least 3 points for a polygon
                 num_points = len(vertices) // 2
                 if num_points < 3:
                     skipped_small += 1
                     continue
-                
+
                 # Calculate bounding box to filter out small items (legends, drillhole lith boxes)
                 xs = [vertices[i] for i in range(0, len(vertices), 2)]
                 ys = [vertices[i] for i in range(1, len(vertices), 2)]
                 width = max(xs) - min(xs)
                 height = max(ys) - min(ys)
                 area = width * height
-                
+
                 # Filter out small items - minimum 500 sq units (adjustable)
                 # This excludes legend boxes and small drillhole lithology rectangles
                 MIN_AREA = 500
@@ -426,16 +381,16 @@ class FeatureExtractor:
                     skipped_small += 1
                     logger.debug(f"Skipped small drawing: {width:.1f}x{height:.1f} = {area:.1f} sq units")
                     continue
-                
+
                 # Only accept filled or closed shapes with enough points
                 if not (has_fill or is_closed):
                     if len(items) < 5:  # Small unfilled shapes likely aren't geological units
                         skipped_unfilled += 1
                         continue
-                
+
                 # Create polygon data
                 formation = self._identify_formation(color)
-                
+
                 polygon_data = {
                     "type": "Polygon",
                     "vertices": vertices,
@@ -446,14 +401,14 @@ class FeatureExtractor:
                     "source": "drawing",
                 }
                 polygons.append(polygon_data)
-            
+
             if skipped_grayscale or skipped_unfilled or skipped_small:
                 logger.debug(f"Drawing extraction skipped: {skipped_grayscale} grayscale, "
                            f"{skipped_unfilled} unfilled, {skipped_small} too small")
-                
+
         except Exception as e:
             logger.warning(f"Error extracting from drawings: {e}")
-        
+
         return polygons, faults
 
     def _get_formation_from_annot(self, annot, color) -> str:
@@ -500,7 +455,7 @@ class FeatureExtractor:
                     vertices.extend([float(v.x), float(v.y)])
                 else:
                     vertices.append(float(v))
-        
+
         # For Line annotations (type 3), also try the line attribute
         if not vertices and annot_type == 3:
             if hasattr(annot, "line") and annot.line:
@@ -509,28 +464,6 @@ class FeatureExtractor:
                 if len(line) >= 2:
                     vertices = [float(line[0].x), float(line[0].y),
                                float(line[1].x), float(line[1].y)]
-
-        # For Ink annotations (type 15), use ink_list property
-        # Ink annotations can have multiple strokes - we concatenate them
-        if not vertices and annot_type == 15:
-            try:
-                # Try to get ink_list (list of point lists for each stroke)
-                ink_list = None
-                if hasattr(annot, "ink_list"):
-                    ink_list = annot.ink_list
-                elif hasattr(annot, "get_ink_list"):
-                    ink_list = annot.get_ink_list()
-
-                if ink_list:
-                    for stroke in ink_list:
-                        for point in stroke:
-                            if hasattr(point, 'x') and hasattr(point, 'y'):
-                                vertices.extend([float(point.x), float(point.y)])
-                            elif isinstance(point, (tuple, list)) and len(point) >= 2:
-                                vertices.extend([float(point[0]), float(point[1])])
-                    logger.debug(f"Extracted {len(vertices)//2} points from Ink annotation")
-            except Exception as e:
-                logger.warning(f"Error extracting Ink annotation vertices: {e}")
 
         # Fall back to rect if no vertices found
         if not vertices and hasattr(annot, "rect"):
