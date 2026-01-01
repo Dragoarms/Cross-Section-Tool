@@ -561,22 +561,184 @@ def write_assignments_batch(
     return results
 
 
+def heal_contact_gaps(
+    contacts: List[Dict],
+    max_gap_distance: float = 10.0,
+    snap_to_endpoints: bool = True
+) -> List[Dict]:
+    """
+    Heal gaps between adjacent contacts by extending/connecting endpoints.
+
+    This is useful when contacts don't quite meet due to extraction artifacts.
+
+    Args:
+        contacts: List of contact dicts with 'vertices' and 'name'
+        max_gap_distance: Maximum distance to heal (in coordinate units)
+        snap_to_endpoints: If True, snap nearby endpoints together
+
+    Returns:
+        List of contacts with healed gaps
+    """
+    if len(contacts) < 2:
+        return contacts
+
+    healed_contacts = [dict(c) for c in contacts]  # Deep copy
+    healed_count = 0
+
+    # Get endpoints for all contacts
+    endpoints = []
+    for i, contact in enumerate(healed_contacts):
+        vertices = contact.get('vertices', [])
+        if len(vertices) < 4:
+            continue
+
+        # Start point
+        endpoints.append({
+            'contact_idx': i,
+            'is_start': True,
+            'x': vertices[0],
+            'y': vertices[1],
+        })
+        # End point
+        endpoints.append({
+            'contact_idx': i,
+            'is_start': False,
+            'x': vertices[-2],
+            'y': vertices[-1],
+        })
+
+    # Find and heal gaps
+    import numpy as np
+
+    for i, ep1 in enumerate(endpoints):
+        for j, ep2 in enumerate(endpoints):
+            if i >= j:  # Skip self and already checked
+                continue
+            if ep1['contact_idx'] == ep2['contact_idx']:  # Same contact
+                continue
+
+            # Calculate distance
+            dist = np.sqrt((ep1['x'] - ep2['x'])**2 + (ep1['y'] - ep2['y'])**2)
+
+            if dist <= max_gap_distance and dist > 0.1:
+                # Heal the gap by averaging the positions
+                mid_x = (ep1['x'] + ep2['x']) / 2
+                mid_y = (ep1['y'] + ep2['y']) / 2
+
+                # Update the contact vertices
+                contact1 = healed_contacts[ep1['contact_idx']]
+                contact2 = healed_contacts[ep2['contact_idx']]
+                vertices1 = contact1['vertices']
+                vertices2 = contact2['vertices']
+
+                if snap_to_endpoints:
+                    # Move both endpoints to the midpoint
+                    if ep1['is_start']:
+                        vertices1[0] = mid_x
+                        vertices1[1] = mid_y
+                    else:
+                        vertices1[-2] = mid_x
+                        vertices1[-1] = mid_y
+
+                    if ep2['is_start']:
+                        vertices2[0] = mid_x
+                        vertices2[1] = mid_y
+                    else:
+                        vertices2[-2] = mid_x
+                        vertices2[-1] = mid_y
+
+                    healed_count += 1
+                    logger.debug(
+                        f"Healed gap ({dist:.1f} units) between "
+                        f"{contact1.get('name', 'unknown')} and {contact2.get('name', 'unknown')}"
+                    )
+
+    logger.info(f"Healed {healed_count} contact gaps")
+    return healed_contacts
+
+
+def extend_contacts_to_boundaries(
+    contacts: List[Dict],
+    left_boundary: float,
+    right_boundary: float,
+    extension_distance: float = 20.0
+) -> List[Dict]:
+    """
+    Extend contacts that nearly reach the section boundaries.
+
+    Args:
+        contacts: List of contact dicts with 'vertices'
+        left_boundary: Left edge X coordinate
+        right_boundary: Right edge X coordinate
+        extension_distance: Max distance from boundary to extend
+
+    Returns:
+        List of contacts with extended endpoints
+    """
+    import numpy as np
+
+    extended_contacts = [dict(c) for c in contacts]
+    extended_count = 0
+
+    for contact in extended_contacts:
+        vertices = contact.get('vertices', [])
+        if len(vertices) < 4:
+            continue
+
+        # Check start point (left end)
+        start_x, start_y = vertices[0], vertices[1]
+        if abs(start_x - left_boundary) <= extension_distance:
+            # Extend to left boundary
+            if len(vertices) >= 4:
+                # Use direction from first segment
+                dx = vertices[0] - vertices[2]
+                dy = vertices[1] - vertices[3]
+                length = np.sqrt(dx**2 + dy**2)
+                if length > 0:
+                    # Extend to boundary
+                    extend_dist = start_x - left_boundary
+                    new_x = left_boundary
+                    new_y = start_y + (dy / dx) * extend_dist if abs(dx) > 0.001 else start_y
+                    vertices[0] = new_x
+                    vertices[1] = new_y
+                    extended_count += 1
+
+        # Check end point (right end)
+        end_x, end_y = vertices[-2], vertices[-1]
+        if abs(end_x - right_boundary) <= extension_distance:
+            # Extend to right boundary
+            if len(vertices) >= 4:
+                dx = vertices[-2] - vertices[-4]
+                dy = vertices[-1] - vertices[-3]
+                length = np.sqrt(dx**2 + dy**2)
+                if length > 0:
+                    extend_dist = right_boundary - end_x
+                    new_x = right_boundary
+                    new_y = end_y + (dy / dx) * extend_dist if abs(dx) > 0.001 else end_y
+                    vertices[-2] = new_x
+                    vertices[-1] = new_y
+                    extended_count += 1
+
+    logger.info(f"Extended {extended_count} contact endpoints to boundaries")
+    return extended_contacts
+
+
 if __name__ == "__main__":
     # Test/demo code
     import sys
-    
+
     logging.basicConfig(level=logging.DEBUG)
-    
+
     if len(sys.argv) < 2:
         print("Usage: python pdf_annotation_writer.py <pdf_file>")
         print("\nThis module provides PDF annotation writing capabilities.")
         print("Import it in your main application to use its functions.")
         sys.exit(1)
-    
+
     # Simple test - list existing annotations
     pdf_path = sys.argv[1]
     doc = fitz.open(pdf_path)
-    
+
     for page_num, page in enumerate(doc):
         print(f"\nPage {page_num}:")
         for annot in page.annots():
@@ -585,5 +747,5 @@ if __name__ == "__main__":
             print(f"    Author: {info.get('title', 'N/A')}")
             print(f"    Subject: {info.get('subject', 'N/A')}")
             print(f"    Vertices: {len(annot.vertices) if annot.vertices else 0} points")
-    
+
     doc.close()

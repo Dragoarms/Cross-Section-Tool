@@ -138,6 +138,11 @@ class TieLineEditor:
         self.tie_line_artists = []  # List of tie line artists
         self.temp_tie_line = None  # Temporary line while drawing
         self.snap_highlight = None  # Visual indicator for snap target
+
+        # Editing state
+        self.edit_mode = False
+        self.selected_vertex = None  # (polyline, vertex_idx, northing)
+        self.dragging_vertex = False
         
         # Create window
         self.create_window()
@@ -310,23 +315,62 @@ class TieLineEditor:
             btn_frame, text="Accept Suggestions",
             command=self.accept_suggestions
         ).pack(side=tk.LEFT, padx=2)
-        
+
+        # Contact Editing controls
+        edit_frame = ttk.LabelFrame(control_frame, text="Contact Editing", padding=5)
+        edit_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Edit mode toggle
+        self.edit_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            edit_frame, text="Enable vertex editing",
+            variable=self.edit_mode_var,
+            command=self.toggle_edit_mode
+        ).pack(anchor=tk.W)
+
+        edit_btn_frame = ttk.Frame(edit_frame)
+        edit_btn_frame.pack(fill=tk.X, pady=3)
+
+        ttk.Button(
+            edit_btn_frame, text="Clean Hooks",
+            command=self.clean_contact_hooks
+        ).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(
+            edit_btn_frame, text="Smooth",
+            command=self.smooth_contact
+        ).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(
+            edit_btn_frame, text="Delete Vertex",
+            command=self.delete_selected_vertex
+        ).pack(side=tk.LEFT, padx=2)
+
+        self.edit_info_label = ttk.Label(
+            edit_frame,
+            text="Select a contact group, then\nenable editing to modify vertices",
+            font=('Arial', 8)
+        )
+        self.edit_info_label.pack(anchor=tk.W, pady=2)
+
         # Instructions
         instr_frame = ttk.LabelFrame(control_frame, text="Instructions", padding=5)
         instr_frame.pack(fill=tk.X, padx=5, pady=5)
-        
+
         instructions = """
 1. Select a contact group from the list
 2. Click on a contact line to start a tie
-3. Click on the corresponding contact in 
+3. Click on the corresponding contact in
    an ADJACENT section to complete the tie
 4. Press Escape to cancel a tie in progress
 5. Ties can only connect adjacent sections
 6. Use Auto-Suggest for automatic ties
 
-Tips:
-- Tie lines connect equivalent points
-- Draw ties at key structural points
+Editing Mode:
+- Enable editing to modify vertices
+- Right-click a vertex to delete it
+- Drag vertices to move them
+- Use Clean Hooks to remove artifacts
 - Start/end/inflection points are best
         """
         ttk.Label(instr_frame, text=instructions.strip(), justify=tk.LEFT).pack(anchor=tk.W)
@@ -620,7 +664,12 @@ Tips:
         if event.inaxes != self.ax:
             return
 
-        if event.button != 1:  # Left click only
+        # Handle edit mode clicks (left or right click)
+        if self.edit_mode and (event.button == 1 or event.button == 3):
+            if self.on_edit_click(event):
+                return
+
+        if event.button != 1:  # Left click only for tie line mode
             return
 
         click_x, click_y = event.xdata, event.ydata
@@ -969,6 +1018,168 @@ Tips:
             self.cancel_tie()
             self.update_display()
     
+    # === Contact Editing Methods ===
+
+    def toggle_edit_mode(self):
+        """Toggle vertex editing mode on/off."""
+        self.edit_mode = self.edit_mode_var.get()
+        self.selected_vertex = None
+        self.dragging_vertex = False
+
+        if self.edit_mode:
+            self.edit_info_label.config(text="EDIT MODE: Click vertices to select\nRight-click to delete")
+            self.status_var.set("Edit mode enabled - click vertices to select")
+        else:
+            self.edit_info_label.config(text="Select a contact group, then\nenable editing to modify vertices")
+            self.status_var.set("Edit mode disabled")
+
+        self.update_display()
+
+    def clean_contact_hooks(self):
+        """Clean hooks from all contacts in the current group."""
+        if not self.current_contact_group:
+            messagebox.showwarning("No Selection", "Please select a contact group first.")
+            return
+
+        group = self.grouped_contacts.get(self.current_contact_group)
+        if not group:
+            return
+
+        from geotools.contact_postprocess import remove_hooks_iterative
+
+        cleaned_count = 0
+        for polyline in group.polylines:
+            vertices = polyline.vertices
+            if len(vertices) < 8:
+                continue
+
+            # Convert to coordinate list
+            coords = []
+            for i in range(0, len(vertices), 2):
+                if i + 1 < len(vertices):
+                    coords.append((vertices[i], vertices[i + 1]))
+
+            original_len = len(coords)
+            coords = remove_hooks_iterative(coords, max_iterations=3)
+
+            if len(coords) < original_len:
+                new_vertices = []
+                for x, y in coords:
+                    new_vertices.extend([x, y])
+                polyline.vertices = new_vertices
+                cleaned_count += 1
+
+        self.status_var.set(f"Cleaned hooks from {cleaned_count} contacts")
+        self.update_display()
+
+    def smooth_contact(self):
+        """Apply smoothing to all contacts in the current group."""
+        if not self.current_contact_group:
+            messagebox.showwarning("No Selection", "Please select a contact group first.")
+            return
+
+        group = self.grouped_contacts.get(self.current_contact_group)
+        if not group:
+            return
+
+        from geotools.contact_postprocess import smooth_contact as smooth_func
+
+        smoothed_count = 0
+        for polyline in group.polylines:
+            vertices = polyline.vertices
+            if len(vertices) < 6:
+                continue
+
+            # Convert to coordinate list
+            coords = []
+            for i in range(0, len(vertices), 2):
+                if i + 1 < len(vertices):
+                    coords.append((vertices[i], vertices[i + 1]))
+
+            coords = smooth_func(coords, window_size=3, preserve_endpoints=True)
+
+            new_vertices = []
+            for x, y in coords:
+                new_vertices.extend([x, y])
+            polyline.vertices = new_vertices
+            smoothed_count += 1
+
+        self.status_var.set(f"Smoothed {smoothed_count} contacts")
+        self.update_display()
+
+    def delete_selected_vertex(self):
+        """Delete the currently selected vertex."""
+        if not self.selected_vertex:
+            messagebox.showinfo("No Selection", "Click on a vertex to select it first.")
+            return
+
+        polyline, vertex_idx, northing = self.selected_vertex
+        num_vertices = len(polyline.vertices) // 2
+
+        if num_vertices <= 2:
+            messagebox.showwarning("Cannot Delete", "Contact must have at least 2 vertices.")
+            return
+
+        # Confirm deletion
+        if not messagebox.askyesno("Confirm Delete", f"Delete vertex {vertex_idx} from this contact?"):
+            return
+
+        # Delete the vertex
+        start_idx = vertex_idx * 2
+        del polyline.vertices[start_idx:start_idx + 2]
+
+        self.selected_vertex = None
+        self.status_var.set(f"Deleted vertex {vertex_idx}")
+        self.update_display()
+
+    def on_edit_click(self, event):
+        """Handle click in edit mode - select vertex."""
+        if not self.edit_mode or event.inaxes != self.ax:
+            return False
+
+        click_x, click_y = event.xdata, event.ydata
+
+        # Find nearest vertex across all displayed contacts
+        best_match = None
+        min_dist = self.SNAP_RADIUS
+
+        for line, data in self.contact_lines.items():
+            if self.current_contact_group and data['group'] != self.current_contact_group:
+                continue
+
+            polyline = data['polyline']
+            y_offset = data['y_offset']
+            coords = polyline.get_coords()
+
+            for i, (e, rl) in enumerate(coords):
+                dist = np.sqrt((e - click_x)**2 + (rl + y_offset - click_y)**2)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match = (polyline, i, data['northing'], y_offset, e, rl)
+
+        if best_match:
+            polyline, idx, northing, y_offset, e, rl = best_match
+            self.selected_vertex = (polyline, idx, northing)
+
+            # Right-click to delete
+            if event.button == 3:
+                self.delete_selected_vertex()
+                return True
+
+            self.status_var.set(f"Selected vertex {idx} at E={e:.1f}, RL={rl:.1f}")
+            self.update_display()
+
+            # Highlight selected vertex
+            self.ax.scatter(
+                [e], [rl + y_offset],
+                s=150, c='yellow', marker='s',
+                edgecolors='red', linewidths=2, zorder=30
+            )
+            self.canvas.draw()
+            return True
+
+        return False
+
     def export_contacts(self):
         """Export contacts with tie lines."""
         # This will integrate with the main app's export functionality
@@ -983,7 +1194,7 @@ Tips:
                 f"Tie lines: {sum(len(g.tie_lines) for g in self.grouped_contacts.values())}\n\n"
                 "Close this window and use Export > Contacts to DXF"
             )
-        
+
         self.window.destroy()
 
 
