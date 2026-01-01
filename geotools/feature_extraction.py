@@ -89,23 +89,45 @@ class FeatureExtractor:
 
     def _is_fault_line(self, annot) -> Tuple[bool, str]:
         """
-        Check if an annotation is a fault line (subject contains 'Fault').
-        
+        Check if an annotation is a fault line.
+
+        Checks subject, title, author, and content fields for:
+        - 'fault' keyword (case insensitive)
+        - Shortened versions like 'F1', 'F2', 'F10', etc.
+
         Returns:
             (is_fault, fault_name)
         """
+        import re
+
         if not hasattr(annot, 'info'):
             return False, ""
 
         info = annot.info
-        subject = info.get('subject', '') or info.get('content', '') or ''
 
-        # Check if subject contains 'Fault' (case insensitive)
-        subject_lower = subject.lower().strip()
-        if 'fault' in subject_lower:
-            # Extract fault name
-            fault_name = subject.strip() if subject.strip() else "Fault"
-            return True, fault_name
+        # Check all relevant metadata fields
+        fields_to_check = [
+            ('subject', info.get('subject', '') or ''),
+            ('title', info.get('title', '') or ''),
+            ('author', info.get('author', '') or ''),
+            ('content', info.get('content', '') or ''),
+        ]
+
+        # Pattern for fault: "fault" or "F" followed by number (F1, F2, F10, etc.)
+        fault_pattern = re.compile(r'\bfault\b|^f\d+$|^f\s*\d+$|\bf\d+\b', re.IGNORECASE)
+
+        for field_name, field_value in fields_to_check:
+            if not field_value or not field_value.strip():
+                continue
+
+            field_lower = field_value.lower().strip()
+
+            # Check for 'fault' keyword or F{number} pattern
+            if fault_pattern.search(field_value):
+                # Use the field value as fault name
+                fault_name = field_value.strip()
+                logger.debug(f"Fault detected in {field_name}: '{fault_name}'")
+                return True, fault_name
 
         return False, ""
 
@@ -158,8 +180,9 @@ class FeatureExtractor:
                     logger.debug(f"Skipped annotation - no author tag")
                     continue
                 
-                # Check if this is a line/polyline (types 3, 9)
-                is_line_type = annot_type in [3, 9]  # Line, PolyLine
+                # Check if this is a line/polyline (types 3, 9, 15)
+                # Type 3 = Line, Type 9 = PolyLine, Type 15 = Ink (pencil/freehand)
+                is_line_type = annot_type in [3, 9, 15]
                 
                 # Check if this is a polygon type (types 4, 5, 6, 10)
                 is_polygon_type = annot_type in [4, 5, 6, 10]  # Square, Circle, Highlight, Polygon
@@ -462,9 +485,31 @@ class FeatureExtractor:
                 # line attribute returns two Point objects
                 line = annot.line
                 if len(line) >= 2:
-                    vertices = [float(line[0].x), float(line[0].y), 
+                    vertices = [float(line[0].x), float(line[0].y),
                                float(line[1].x), float(line[1].y)]
-        
+
+        # For Ink annotations (type 15), use ink_list property
+        # Ink annotations can have multiple strokes - we concatenate them
+        if not vertices and annot_type == 15:
+            try:
+                # Try to get ink_list (list of point lists for each stroke)
+                ink_list = None
+                if hasattr(annot, "ink_list"):
+                    ink_list = annot.ink_list
+                elif hasattr(annot, "get_ink_list"):
+                    ink_list = annot.get_ink_list()
+
+                if ink_list:
+                    for stroke in ink_list:
+                        for point in stroke:
+                            if hasattr(point, 'x') and hasattr(point, 'y'):
+                                vertices.extend([float(point.x), float(point.y)])
+                            elif isinstance(point, (tuple, list)) and len(point) >= 2:
+                                vertices.extend([float(point[0]), float(point[1])])
+                    logger.debug(f"Extracted {len(vertices)//2} points from Ink annotation")
+            except Exception as e:
+                logger.warning(f"Error extracting Ink annotation vertices: {e}")
+
         # Fall back to rect if no vertices found
         if not vertices and hasattr(annot, "rect"):
             rect = annot.rect

@@ -12,14 +12,23 @@ from .feature_extraction import FeatureExtractor
 from .strat_column import StratColumn
 from .batch_processor import BatchProcessor
 from .section_correlation import SectionCorrelator
-from .pdf_calibration import ExtractionFilter, PDFCalibrationDialog, open_calibration_dialog
+
+# GUI components are optional (require tkinter)
+try:
+    from .pdf_calibration import ExtractionFilter, PDFCalibrationDialog, open_calibration_dialog
+    _GUI_AVAILABLE = True
+except ImportError:
+    ExtractionFilter = None
+    PDFCalibrationDialog = None
+    open_calibration_dialog = None
+    _GUI_AVAILABLE = False
 
 __version__ = "1.1.0"
 __author__ = "GeoTools Team"
 
 __all__ = [
     "GeoReferencer",
-    "FeatureExtractor", 
+    "FeatureExtractor",
     "StratColumn",
     "BatchProcessor",
     "SectionCorrelator",
