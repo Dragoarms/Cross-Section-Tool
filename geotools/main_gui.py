@@ -56,6 +56,68 @@ if __name__ == "__main__" or "debug" in sys.argv:
     logger.setLevel(logging.DEBUG)
 
 
+class CollapsibleFrame(ttk.Frame):
+    """A frame that can be collapsed/expanded with a toggle button."""
+
+    def __init__(self, parent, title="", collapsed=False, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        self.is_collapsed = collapsed
+        self._title = title
+
+        # Header frame with toggle button
+        self.header = ttk.Frame(self)
+        self.header.pack(fill=tk.X)
+
+        # Toggle button with arrow indicator
+        self.toggle_btn = ttk.Button(
+            self.header,
+            text=self._get_toggle_text(),
+            command=self.toggle,
+            width=3
+        )
+        self.toggle_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Title label (clickable)
+        self.title_label = ttk.Label(
+            self.header,
+            text=title,
+            font=("Arial", 9, "bold"),
+            cursor="hand2"
+        )
+        self.title_label.pack(side=tk.LEFT, fill=tk.X)
+        self.title_label.bind("<Button-1>", lambda e: self.toggle())
+
+        # Content frame
+        self.content = ttk.Frame(self)
+        if not collapsed:
+            self.content.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+    def _get_toggle_text(self):
+        """Get the arrow indicator text."""
+        return "▼" if not self.is_collapsed else "▶"
+
+    def toggle(self):
+        """Toggle collapsed state."""
+        self.is_collapsed = not self.is_collapsed
+        self.toggle_btn.config(text=self._get_toggle_text())
+
+        if self.is_collapsed:
+            self.content.pack_forget()
+        else:
+            self.content.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+    def expand(self):
+        """Expand the frame."""
+        if self.is_collapsed:
+            self.toggle()
+
+    def collapse(self):
+        """Collapse the frame."""
+        if not self.is_collapsed:
+            self.toggle()
+
+
 class GeologicalCrossSectionGUI:
     """Main GUI application for geological cross-section analysis with integrated section viewer."""
 
@@ -565,125 +627,13 @@ class GeologicalCrossSectionGUI:
         assignment_outer = ttk.Frame(content_paned)
         content_paned.add(assignment_outer, weight=1)
 
-        # Compact actions bar at TOP (always visible)
-        actions_frame = ttk.Frame(assignment_outer)
-        actions_frame.pack(fill=tk.X, padx=5, pady=3)
-        
-        # Export actions (left side)
-        export_frame = ttk.LabelFrame(actions_frame, text="Export", padding=2)
-        export_frame.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(export_frame, text="DXF", width=5,
-                   command=self._export_all_sections_dxf).pack(side=tk.LEFT, padx=1)
-        ttk.Button(export_frame, text="GeoTIFF", width=7,
-                   command=self.export_geotiff).pack(side=tk.LEFT, padx=1)
-        ttk.Button(export_frame, text="To PDF", width=6,
-                   command=self.write_assignments_to_pdf).pack(side=tk.LEFT, padx=1)
-        
-        # Config actions
-        config_frame = ttk.LabelFrame(actions_frame, text="Config", padding=2)
-        config_frame.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(config_frame, text="Save", width=5,
-                   command=self.save_strat_column).pack(side=tk.LEFT, padx=1)
-        ttk.Button(config_frame, text="Load", width=5,
-                   command=self.load_strat_column).pack(side=tk.LEFT, padx=1)
-        
-        # Auto-assign
-        ttk.Button(actions_frame, text="Auto-Name", width=9,
-                   command=self._auto_assign_from_pdf_names).pack(side=tk.LEFT, padx=3)
+        # ========== TOP SECTION: Classification Mode (always visible) ==========
+        top_frame = ttk.Frame(assignment_outer)
+        top_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Mode indicator (right side)
-        self.mode_label = ttk.Label(actions_frame, text="Mode: View Only", font=("Arial", 9, "bold"))
-        self.mode_label.pack(side=tk.RIGHT, padx=5)
-
-        # Scrollable canvas for the rest of the controls
-        right_canvas = tk.Canvas(assignment_outer, highlightthickness=0)
-        right_scrollbar = ttk.Scrollbar(assignment_outer, orient="vertical", command=right_canvas.yview)
-        assignment_frame = ttk.Frame(right_canvas)
-        
-        assignment_frame.bind(
-            "<Configure>",
-            lambda e: right_canvas.configure(scrollregion=right_canvas.bbox("all"))
-        )
-        
-        right_canvas.create_window((0, 0), window=assignment_frame, anchor="nw")
-        right_canvas.configure(yscrollcommand=right_scrollbar.set)
-        
-        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Enable mousewheel scrolling
-        def _on_right_mousewheel(event):
-            right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        right_canvas.bind_all("<MouseWheel>", _on_right_mousewheel, add='+')
-
-        # Feature browser - show all extracted items (consolidated)
-        browser_frame = ttk.LabelFrame(assignment_frame, text="Extracted Features", padding=5)
-        browser_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Feature tree showing all polygons, faults, and contacts
-        feature_tree_frame = ttk.Frame(browser_frame)
-        feature_tree_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.section_feature_tree = ttk.Treeview(
-            feature_tree_frame,
-            columns=("type", "formation", "assigned"),
-            height=10,
-            selectmode=tk.EXTENDED
-        )
-        self.section_feature_tree.heading("#0", text="Name")
-        self.section_feature_tree.heading("type", text="Type")
-        self.section_feature_tree.heading("formation", text="Original")
-        self.section_feature_tree.heading("assigned", text="Assigned")
-        self.section_feature_tree.column("#0", width=120)
-        self.section_feature_tree.column("type", width=60)
-        self.section_feature_tree.column("formation", width=80)
-        self.section_feature_tree.column("assigned", width=80)
-        
-        feature_scrollbar = ttk.Scrollbar(feature_tree_frame, orient=tk.VERTICAL, 
-                                          command=self.section_feature_tree.yview)
-        self.section_feature_tree.configure(yscrollcommand=feature_scrollbar.set)
-        self.section_feature_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        feature_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Bind selection event
-        self.section_feature_tree.bind("<<TreeviewSelect>>", self.on_feature_tree_select)
-        
-        # Consolidated selection controls (grouped)
-        selection_controls_frame = ttk.Frame(browser_frame)
-        selection_controls_frame.pack(fill=tk.X, pady=3)
-        
-        # Row 1: List controls
-        row1 = ttk.Frame(selection_controls_frame)
-        row1.pack(fill=tk.X, pady=1)
-        ttk.Button(row1, text="Refresh", width=8,
-                   command=self.refresh_feature_browser).pack(side=tk.LEFT, padx=1)
-        ttk.Button(row1, text="Highlight", width=8,
-                   command=self.highlight_selected_features).pack(side=tk.LEFT, padx=1)
-        ttk.Button(row1, text="Select Similar", width=10,
-                   command=self.select_similar).pack(side=tk.LEFT, padx=1)
-        
-        # Row 2: Selection actions
-        row2 = ttk.Frame(selection_controls_frame)
-        row2.pack(fill=tk.X, pady=1)
-        ttk.Button(row2, text="Clear Selection", width=12,
-                   command=self.clear_selection).pack(side=tk.LEFT, padx=1)
-        ttk.Button(row2, text="Unassign Selected", width=14,
-                   command=self.unassign_selected).pack(side=tk.LEFT, padx=1)
-
-        # Row 3: Bulk assignment
-        row3 = ttk.Frame(selection_controls_frame)
-        row3.pack(fill=tk.X, pady=1)
-        ttk.Label(row3, text="Assign to:").pack(side=tk.LEFT, padx=1)
-        self.bulk_assign_combo = ttk.Combobox(row3, state="readonly", width=15)
-        self.bulk_assign_combo.pack(side=tk.LEFT, padx=1)
-        ttk.Button(row3, text="Assign", width=8,
-                   command=self.bulk_assign_selected).pack(side=tk.LEFT, padx=1)
-
-        # Classification mode selection
-        mode_frame = ttk.LabelFrame(assignment_frame, text="Classification Mode", padding=5)
-        mode_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Classification mode selection (always visible at top)
+        mode_frame = ttk.LabelFrame(top_frame, text="Classification Mode", padding=5)
+        mode_frame.pack(fill=tk.X)
 
         self.mode_var = tk.StringVar(value="none")
         mode_row = ttk.Frame(mode_frame)
@@ -705,20 +655,131 @@ class GeologicalCrossSectionGUI:
             value="contact", command=self.on_classification_mode_changed
         ).pack(side=tk.LEFT, padx=3)
 
-        # Units frame with prospect grouping
-        units_frame = ttk.LabelFrame(assignment_frame, text="Geological Units (by Prospect)", padding=5)
-        units_frame.pack(fill=tk.BOTH, padx=5, pady=5, expand=True)
+        # Mode indicator
+        self.mode_label = ttk.Label(mode_frame, text="Mode: View Only", font=("Arial", 9, "bold"))
+        self.mode_label.pack(side=tk.RIGHT, padx=5)
 
-        # Prospect management buttons
-        prospect_btn_frame = ttk.Frame(units_frame)
+        # Assignment info (status bar within classification mode)
+        info_row = ttk.Frame(mode_frame)
+        info_row.pack(fill=tk.X, pady=(5, 0))
+        self.assignment_label = ttk.Label(info_row, text="Click a unit/fault button, then click items",
+                                          wraplength=250)
+        self.assignment_label.pack(side=tk.LEFT)
+        self.count_label = ttk.Label(info_row, text="0 selected", font=("Arial", 9, "bold"))
+        self.count_label.pack(side=tk.RIGHT)
+
+        # ========== MIDDLE SECTION: Scrollable collapsible panels ==========
+        # Scrollable canvas for the collapsible sections
+        right_canvas = tk.Canvas(assignment_outer, highlightthickness=0)
+        right_scrollbar = ttk.Scrollbar(assignment_outer, orient="vertical", command=right_canvas.yview)
+        assignment_frame = ttk.Frame(right_canvas)
+
+        assignment_frame.bind(
+            "<Configure>",
+            lambda e: right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+        )
+
+        right_canvas.create_window((0, 0), window=assignment_frame, anchor="nw")
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
+
+        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Store reference for width updates
+        self.right_canvas = right_canvas
+        self.assignment_frame = assignment_frame
+
+        # Enable mousewheel scrolling
+        def _on_right_mousewheel(event):
+            right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        right_canvas.bind_all("<MouseWheel>", _on_right_mousewheel, add='+')
+
+        # ===== 1. EXTRACTED FEATURES (collapsible) =====
+        self.features_collapsible = CollapsibleFrame(assignment_frame, title="Extracted Features")
+        self.features_collapsible.pack(fill=tk.X, padx=5, pady=3)
+        browser_content = self.features_collapsible.content
+
+        # Feature tree showing all polygons, faults, and contacts
+        feature_tree_frame = ttk.Frame(browser_content)
+        feature_tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.section_feature_tree = ttk.Treeview(
+            feature_tree_frame,
+            columns=("type", "formation", "assigned"),
+            height=8,
+            selectmode=tk.EXTENDED
+        )
+        self.section_feature_tree.heading("#0", text="Name")
+        self.section_feature_tree.heading("type", text="Type")
+        self.section_feature_tree.heading("formation", text="Original")
+        self.section_feature_tree.heading("assigned", text="Assigned")
+        self.section_feature_tree.column("#0", width=100, minwidth=60)
+        self.section_feature_tree.column("type", width=50, minwidth=40)
+        self.section_feature_tree.column("formation", width=70, minwidth=50)
+        self.section_feature_tree.column("assigned", width=70, minwidth=50)
+
+        feature_scrollbar = ttk.Scrollbar(feature_tree_frame, orient=tk.VERTICAL,
+                                          command=self.section_feature_tree.yview)
+        self.section_feature_tree.configure(yscrollcommand=feature_scrollbar.set)
+        self.section_feature_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        feature_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind selection event
+        self.section_feature_tree.bind("<<TreeviewSelect>>", self.on_feature_tree_select)
+
+        # Selection controls (compact rows)
+        selection_controls_frame = ttk.Frame(browser_content)
+        selection_controls_frame.pack(fill=tk.X, pady=3)
+
+        # Row 1: List controls
+        row1 = ttk.Frame(selection_controls_frame)
+        row1.pack(fill=tk.X, pady=1)
+        ttk.Button(row1, text="Refresh", width=7,
+                   command=self.refresh_feature_browser).pack(side=tk.LEFT, padx=1)
+        ttk.Button(row1, text="Highlight", width=7,
+                   command=self.highlight_selected_features).pack(side=tk.LEFT, padx=1)
+        ttk.Button(row1, text="Similar", width=6,
+                   command=self.select_similar).pack(side=tk.LEFT, padx=1)
+
+        # Row 2: Selection actions
+        row2 = ttk.Frame(selection_controls_frame)
+        row2.pack(fill=tk.X, pady=1)
+        ttk.Button(row2, text="Clear", width=6,
+                   command=self.clear_selection).pack(side=tk.LEFT, padx=1)
+        ttk.Button(row2, text="Unassign", width=7,
+                   command=self.unassign_selected).pack(side=tk.LEFT, padx=1)
+
+        # Row 3: Bulk assignment
+        row3 = ttk.Frame(selection_controls_frame)
+        row3.pack(fill=tk.X, pady=1)
+        ttk.Label(row3, text="Assign:").pack(side=tk.LEFT, padx=1)
+        self.bulk_assign_combo = ttk.Combobox(row3, state="readonly", width=12)
+        self.bulk_assign_combo.pack(side=tk.LEFT, padx=1, fill=tk.X, expand=True)
+        ttk.Button(row3, text="Go", width=3,
+                   command=self.bulk_assign_selected).pack(side=tk.LEFT, padx=1)
+
+        # ===== 2. GEOLOGICAL UNITS (collapsible) =====
+        self.units_collapsible = CollapsibleFrame(assignment_frame, title="Geological Units")
+        self.units_collapsible.pack(fill=tk.X, padx=5, pady=3)
+        units_content = self.units_collapsible.content
+
+        # Prospect management buttons (compact)
+        prospect_btn_frame = ttk.Frame(units_content)
         prospect_btn_frame.pack(fill=tk.X, pady=2)
-        ttk.Button(prospect_btn_frame, text="+ Add Prospect", command=self.add_new_prospect).pack(side=tk.LEFT, padx=2)
-        ttk.Button(prospect_btn_frame, text="+ Add Unit", command=self.add_new_unit).pack(side=tk.LEFT, padx=2)
-        ttk.Button(prospect_btn_frame, text="Expand All", command=self.expand_all_prospects).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(prospect_btn_frame, text="Collapse All", command=self.collapse_all_prospects).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(prospect_btn_frame, text="+Prospect", width=9,
+                   command=self.add_new_prospect).pack(side=tk.LEFT, padx=1)
+        ttk.Button(prospect_btn_frame, text="+Unit", width=6,
+                   command=self.add_new_unit).pack(side=tk.LEFT, padx=1)
+        ttk.Button(prospect_btn_frame, text="▼", width=2,
+                   command=self.expand_all_prospects).pack(side=tk.RIGHT, padx=1)
+        ttk.Button(prospect_btn_frame, text="▶", width=2,
+                   command=self.collapse_all_prospects).pack(side=tk.RIGHT, padx=1)
 
         # Scrollable canvas for units
-        self.units_canvas = tk.Canvas(units_frame, height=200, highlightthickness=0)
+        units_frame = ttk.Frame(units_content)
+        units_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.units_canvas = tk.Canvas(units_frame, height=150, highlightthickness=0)
         units_scrollbar = ttk.Scrollbar(units_frame, orient="vertical", command=self.units_canvas.yview)
         self.units_inner = ttk.Frame(self.units_canvas)
 
@@ -731,22 +792,26 @@ class GeologicalCrossSectionGUI:
 
         self.units_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         units_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         # Enable mousewheel scrolling on units canvas
         def _on_units_mousewheel(event):
             self.units_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         self.units_canvas.bind("<MouseWheel>", _on_units_mousewheel)
         self.units_inner.bind("<MouseWheel>", _on_units_mousewheel)
-        
+
         # Track expanded/collapsed state per prospect
         self.prospect_expanded = {}  # {prospect_name: bool}
 
-        # Faults frame
-        faults_frame = ttk.LabelFrame(assignment_frame, text="Faults", padding=5)
-        faults_frame.pack(fill=tk.X, padx=5, pady=5)
+        # ===== 3. FAULTS (collapsible) =====
+        self.faults_collapsible = CollapsibleFrame(assignment_frame, title="Faults")
+        self.faults_collapsible.pack(fill=tk.X, padx=5, pady=3)
+        faults_content = self.faults_collapsible.content
 
-        faults_canvas = tk.Canvas(faults_frame, height=100)
-        faults_scrollbar = ttk.Scrollbar(faults_frame, orient="vertical", command=faults_canvas.yview)
+        faults_scroll_frame = ttk.Frame(faults_content)
+        faults_scroll_frame.pack(fill=tk.BOTH, expand=True)
+
+        faults_canvas = tk.Canvas(faults_scroll_frame, height=80, highlightthickness=0)
+        faults_scrollbar = ttk.Scrollbar(faults_scroll_frame, orient="vertical", command=faults_canvas.yview)
         self.faults_inner = ttk.Frame(faults_canvas)
 
         self.faults_inner.bind(
@@ -759,18 +824,39 @@ class GeologicalCrossSectionGUI:
         faults_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         faults_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Button(faults_frame, text="+ Add Fault", command=self.add_new_fault).pack(fill=tk.X, pady=2)
+        ttk.Button(faults_content, text="+ Add Fault", command=self.add_new_fault).pack(fill=tk.X, pady=2)
 
-        # Assignment info (simplified)
-        info_frame = ttk.Frame(assignment_frame)
-        info_frame.pack(fill=tk.X, padx=5, pady=3)
-        
-        self.assignment_label = ttk.Label(info_frame, text="Click a unit/fault button, then click items to assign")
-        self.assignment_label.pack(side=tk.LEFT)
-        
-        self.count_label = ttk.Label(info_frame, text="0 selected", font=("Arial", 9, "bold"))
-        self.count_label.pack(side=tk.RIGHT)
-        
+        # ===== 4. EXPORT & CONFIG (bottom, always visible) =====
+        bottom_frame = ttk.Frame(assignment_frame)
+        bottom_frame.pack(fill=tk.X, padx=5, pady=5, side=tk.BOTTOM)
+
+        # Separator
+        ttk.Separator(bottom_frame, orient="horizontal").pack(fill=tk.X, pady=5)
+
+        # Export row
+        export_row = ttk.Frame(bottom_frame)
+        export_row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(export_row, text="Export:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_row, text="DXF", width=5,
+                   command=self._export_all_sections_dxf).pack(side=tk.LEFT, padx=1)
+        ttk.Button(export_row, text="GeoTIFF", width=7,
+                   command=self.export_geotiff).pack(side=tk.LEFT, padx=1)
+        ttk.Button(export_row, text="To PDF", width=6,
+                   command=self.write_assignments_to_pdf).pack(side=tk.LEFT, padx=1)
+
+        # Config row
+        config_row = ttk.Frame(bottom_frame)
+        config_row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(config_row, text="Config:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(config_row, text="Save", width=5,
+                   command=self.save_strat_column).pack(side=tk.LEFT, padx=1)
+        ttk.Button(config_row, text="Load", width=5,
+                   command=self.load_strat_column).pack(side=tk.LEFT, padx=1)
+        ttk.Button(config_row, text="Auto-Name", width=9,
+                   command=self._auto_assign_from_pdf_names).pack(side=tk.LEFT, padx=3)
+
         # Hidden listboxes for compatibility (not displayed but used by other methods)
         self.selected_listbox = tk.Listbox(assignment_frame, height=0)
         self.polyline_listbox = tk.Listbox(assignment_frame, height=0)
