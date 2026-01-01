@@ -871,6 +871,39 @@ class SectionViewer:
                     poly1 = polygons[name1]['polygon']
                     poly2 = polygons[name2]['polygon']
 
+                    # Skip if polygons are too far apart
+                    if poly1.distance(poly2) > 10.0:
+                        continue
+
+                    try:
+                        from .contact_extraction import extract_single_contact
+
+                        # Use unit_assignment if available, else formation
+                        unit1 = polygons[name1].get('unit', {})
+                        unit2 = polygons[name2].get('unit', {})
+                        form1 = unit1.get('unit_assignment') or unit1.get('formation') or name1
+                        form2 = unit2.get('unit_assignment') or unit2.get('formation') or name2
+
+                        contact = extract_single_contact(
+                            poly1=poly1,
+                            poly2=poly2,
+                            name1=name1,
+                            name2=name2,
+                            form1=form1,
+                            form2=form2,
+                            northing=northing,
+                            buffer_distance=10.0,
+                            simplify_tolerance=2.0
+                        )
+
+                        if contact:
+                            self.calculated_contacts.append(contact)
+                            contacts_found += 1
+                            logger.debug(f"Found contact: {name1}-{name2}")
+
+                    except Exception as e:
+                        logger.warning(f"Error calculating contact {name1}-{name2}: {e}")
+
         logger.info(f"Calculated {contacts_found} contacts")
         self.show_contacts_var.set(True)
         self.show_contacts = True

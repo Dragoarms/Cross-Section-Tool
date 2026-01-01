@@ -2352,7 +2352,7 @@ class GeologicalCrossSectionGUI:
                         ys.append(ys[0])
 
                     is_selected = unit_name in self.selected_units
-                    
+
                     # Get color from assignment if available
                     unit_assignment = unit.get("unit_assignment")
                     if unit_assignment and unit_assignment in self.defined_units:
@@ -2372,6 +2372,13 @@ class GeologicalCrossSectionGUI:
                         color = unit.get("color", (0.5, 0.5, 0.5))
                         alpha = 0.3
                         edgecolor = "black"
+
+                    # Apply transparency based on classification mode
+                    mode = getattr(self, 'classification_mode', 'none')
+                    if mode == 'fault' or mode == 'contact':
+                        # In fault/contact mode, polygons are de-emphasized
+                        alpha = min(alpha, 0.15)
+                        edgecolor = '#cccccc'  # Lighter edges
 
                     poly = MplPolygon(
                         list(zip(xs, ys)),
@@ -2415,11 +2422,21 @@ class GeologicalCrossSectionGUI:
                         linewidth = 3.5  # Thicker for visibility
                         linestyle = "-"
                         zorder = 10  # Higher z-order to appear on top
+                        line_alpha = 1.0
                     else:
                         color = "black"  # Changed from gray for better visibility
                         linewidth = 2.5  # Thicker
                         linestyle = "--"
                         zorder = 9
+                        line_alpha = 0.8
+
+                    # Apply transparency based on classification mode
+                    mode = getattr(self, 'classification_mode', 'none')
+                    if mode == 'polygon' or mode == 'contact':
+                        # In polygon/contact mode, faults are de-emphasized
+                        line_alpha = 0.25
+                        linewidth = 1.5
+                        color = '#888888'  # Gray
 
                     line = ax.plot(
                         x,
@@ -2429,6 +2446,7 @@ class GeologicalCrossSectionGUI:
                         linestyle=linestyle,
                         picker=8,  # Increased picker radius
                         zorder=zorder,  # Draw on top
+                        alpha=line_alpha,
                     )[0]
 
                     self.polyline_patches[line] = {
@@ -5186,25 +5204,42 @@ class GeologicalCrossSectionGUI:
                 except:
                     pass
             return
-        
-        # Check if hovering over any polygon
+
+        # Determine which features to show based on classification mode
+        mode = getattr(self, 'classification_mode', 'none')
+
+        # Check if hovering over any polygon (only in none or polygon mode)
         found_feature = None
-        try:
-            for patch, data in self.unit_patches.items():
-                if patch.contains(event)[0]:
-                    found_feature = data
-                    break
-        except:
-            pass
-        
-        # Check if hovering over any polyline
-        if not found_feature:
+        if mode in ('none', 'polygon'):
+            try:
+                for patch, data in self.unit_patches.items():
+                    if patch.contains(event)[0]:
+                        found_feature = data
+                        found_feature['_feature_type'] = 'polygon'
+                        break
+            except:
+                pass
+
+        # Check if hovering over any polyline (only in none or fault mode)
+        if not found_feature and mode in ('none', 'fault'):
             try:
                 for line, data in self.polyline_patches.items():
                     # Check if line has a figure before calling contains()
                     # This prevents "no figure set when check if mouse is on line" warnings
                     if line.figure is not None and line.contains(event)[0]:
                         found_feature = data
+                        found_feature['_feature_type'] = 'fault'
+                        break
+            except:
+                pass
+
+        # Check if hovering over contacts (only in none or contact mode)
+        if not found_feature and mode in ('none', 'contact'):
+            try:
+                for line, data in getattr(self, 'contact_patches', {}).items():
+                    if line.figure is not None and line.contains(event)[0]:
+                        found_feature = data
+                        found_feature['_feature_type'] = 'contact'
                         break
             except:
                 pass
@@ -5432,12 +5467,21 @@ class GeologicalCrossSectionGUI:
             logger.warning(f"Auto-labeling error: {e}")
             return
         
-        # Apply suggestions (don't overwrite user assignments)
+        # Apply suggestions (don't overwrite user assignments or explicit subject formations)
         applied = 0
         for poly_name, suggested_unit in suggestions.items():
             if poly_name in self.user_assigned_polygons:
                 continue  # Skip user assignments
-            
+
+            # Check if this polygon has an explicit formation from the PDF subject line
+            if poly_name in section_polygons:
+                poly_data = section_polygons[poly_name]
+                if poly_data.get('formation_from_subject', False):
+                    # Don't auto-assign over formations set from PDF subject
+                    existing = poly_data.get('formation', '')
+                    logger.debug(f"Skipping auto-assign for '{poly_name}' - has subject formation '{existing}'")
+                    continue
+
             # Apply the suggestion
             if poly_name in section_polygons:
                 section_polygons[poly_name]['unit_assignment'] = suggested_unit
