@@ -1214,6 +1214,9 @@ class GeologicalCrossSectionGUI:
 
         # Check if clicked on a contact
         for line, info in self.tie_contact_lines.items():
+            # Skip lines without a figure to avoid matplotlib warnings
+            if line.figure is None:
+                continue
             contains, _ = line.contains(event)
             if contains:
                 if not self.drawing_tie:
@@ -5119,7 +5122,9 @@ class GeologicalCrossSectionGUI:
         if not found_feature:
             try:
                 for line, data in self.polyline_patches.items():
-                    if line.contains(event)[0]:
+                    # Check if line has a figure before calling contains()
+                    # This prevents "no figure set when check if mouse is on line" warnings
+                    if line.figure is not None and line.contains(event)[0]:
                         found_feature = data
                         break
             except:

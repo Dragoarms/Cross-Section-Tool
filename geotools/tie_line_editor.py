@@ -677,6 +677,9 @@ Editing Mode:
         # If no contact group selected, check if clicking on any contact to select it
         if self.current_contact_group is None:
             for line, data in self.contact_lines.items():
+                # Skip lines without a figure to avoid matplotlib warnings
+                if line.figure is None:
+                    continue
                 if line.contains(event)[0]:
                     self.select_contact_group(data['group'])
                     return

@@ -95,6 +95,10 @@ class FeatureExtractor:
         - 'fault' keyword (case insensitive)
         - Shortened versions like 'F1', 'F2', 'F10', etc.
 
+        IMPORTANT: Subject field is prioritized for the fault NAME.
+        Other fields are only used to detect if it's a fault, but subject
+        is always preferred as the identifier.
+
         Returns:
             (is_fault, fault_name)
         """
@@ -105,31 +109,49 @@ class FeatureExtractor:
 
         info = annot.info
 
-        # Check all relevant metadata fields
-        fields_to_check = [
-            ('subject', info.get('subject', '') or ''),
-            ('title', info.get('title', '') or ''),
-            ('author', info.get('author', '') or ''),
-            ('content', info.get('content', '') or ''),
-        ]
+        # Get all field values
+        subject = (info.get('subject', '') or '').strip()
+        title = (info.get('title', '') or '').strip()
+        author = (info.get('author', '') or '').strip()
+        content = (info.get('content', '') or '').strip()
 
         # Pattern for fault: "fault" or "F" followed by number (F1, F2, F10, etc.)
         fault_pattern = re.compile(r'\bfault\b|^f\d+$|^f\s*\d+$|\bf\d+\b', re.IGNORECASE)
 
-        for field_name, field_value in fields_to_check:
-            if not field_value or not field_value.strip():
-                continue
+        # Check if ANY field indicates this is a fault
+        is_fault = False
+        for field_value in [subject, title, author, content]:
+            if field_value and fault_pattern.search(field_value):
+                is_fault = True
+                break
 
-            field_lower = field_value.lower().strip()
+        if not is_fault:
+            return False, ""
 
-            # Check for 'fault' keyword or F{number} pattern
-            if fault_pattern.search(field_value):
-                # Use the field value as fault name
-                fault_name = field_value.strip()
-                logger.debug(f"Fault detected in {field_name}: '{fault_name}'")
-                return True, fault_name
+        # PRIORITIZE subject for the fault name
+        # Only fall back to other fields if subject is empty or doesn't match pattern
+        if subject and fault_pattern.search(subject):
+            fault_name = subject
+            logger.debug(f"Fault detected, using subject as name: '{fault_name}'")
+        elif subject:
+            # Subject exists but doesn't match pattern - still use it as name
+            fault_name = subject
+            logger.debug(f"Fault detected, using subject (non-pattern) as name: '{fault_name}'")
+        elif title and fault_pattern.search(title):
+            fault_name = title
+            logger.debug(f"Fault detected, using title as name: '{fault_name}'")
+        elif author and fault_pattern.search(author):
+            fault_name = author
+            logger.debug(f"Fault detected, using author as name: '{fault_name}'")
+        elif content and fault_pattern.search(content):
+            fault_name = content
+            logger.debug(f"Fault detected, using content as name: '{fault_name}'")
+        else:
+            # Fallback - use first non-empty field
+            fault_name = subject or title or author or content or "Fault"
+            logger.debug(f"Fault detected, using fallback name: '{fault_name}'")
 
-        return False, ""
+        return True, fault_name
 
     def _get_author_from_annot(self, annot) -> Optional[str]:
         """Get author/title from annotation metadata."""
