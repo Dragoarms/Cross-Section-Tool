@@ -72,6 +72,11 @@ class TieLineEditor:
     UNIT_ALPHA = 0.25                     # Units are faded
     CONTACT_LINE_WIDTH = 2.5
     TIE_LINE_WIDTH = 1.5
+
+    # Snapping configuration
+    SNAP_RADIUS = 50  # Only snap if within this distance (in coordinate units)
+    SNAP_HIGHLIGHT_COLOR = '#FF0000'  # Red highlight for snap target
+    SNAP_HIGHLIGHT_SIZE = 80  # Size of snap highlight marker
     
     def __init__(
         self,
@@ -132,6 +137,7 @@ class TieLineEditor:
         self.contact_lines = {}  # {line_artist: {'group': str, 'polyline': ContactPolyline}}
         self.tie_line_artists = []  # List of tie line artists
         self.temp_tie_line = None  # Temporary line while drawing
+        self.snap_highlight = None  # Visual indicator for snap target
         
         # Create window
         self.create_window()
@@ -577,42 +583,69 @@ Tips:
             )
             self.tie_line_artists.append(line)
     
+    def _find_snap_target(self, click_x: float, click_y: float) -> Optional[Tuple[Dict, int, float, Tuple[float, float]]]:
+        """
+        Find the nearest snap target (vertex node) within SNAP_RADIUS.
+
+        Args:
+            click_x: Click x coordinate
+            click_y: Click y coordinate (with y_offset already applied in display)
+
+        Returns:
+            Tuple of (contact_data, vertex_idx, distance, (easting, rl)) or None if no snap target
+        """
+        best_snap = None
+        min_dist = float('inf')
+
+        for line, data in self.contact_lines.items():
+            # Only consider the active contact group
+            if self.current_contact_group and data['group'] != self.current_contact_group:
+                continue
+
+            polyline = data['polyline']
+            y_offset = data['y_offset']
+            coords = polyline.get_coords()
+
+            for i, (e, rl) in enumerate(coords):
+                # Calculate distance to this vertex (accounting for y_offset)
+                dist = np.sqrt((e - click_x)**2 + (rl + y_offset - click_y)**2)
+                if dist < min_dist and dist <= self.SNAP_RADIUS:
+                    min_dist = dist
+                    best_snap = (data, i, dist, (e, rl))
+
+        return best_snap
+
     def on_click(self, event):
         """Handle mouse click on the plot."""
         if event.inaxes != self.ax:
             return
-        
+
         if event.button != 1:  # Left click only
             return
-        
-        # Find clicked contact
-        clicked_contact = None
-        min_dist = float('inf')
-        
-        for line, data in self.contact_lines.items():
-            if line.contains(event)[0]:
-                # Get actual distance to line
-                xdata, ydata = line.get_data()
-                for i in range(len(xdata)):
-                    dist = np.sqrt((xdata[i] - event.xdata)**2 + (ydata[i] - event.ydata)**2)
-                    if dist < min_dist:
-                        min_dist = dist
-                        clicked_contact = (line, data, event.xdata, event.ydata)
-        
-        if clicked_contact is None:
+
+        click_x, click_y = event.xdata, event.ydata
+
+        # If no contact group selected, check if clicking on any contact to select it
+        if self.current_contact_group is None:
+            for line, data in self.contact_lines.items():
+                if line.contains(event)[0]:
+                    self.select_contact_group(data['group'])
+                    return
             return
-        
-        line, data, click_x, click_y = clicked_contact
+
+        # Find snap target within SNAP_RADIUS
+        snap_target = self._find_snap_target(click_x, click_y)
+
+        if snap_target is None:
+            self.status_var.set(f"Click closer to a node (within {self.SNAP_RADIUS} units)")
+            return
+
+        data, nearest_idx, snap_dist, nearest_point = snap_target
         group_name = data['group']
         northing = data['northing']
         y_offset = data['y_offset']
         polyline = data['polyline']
-        
-        # If no contact group is selected, select this one
-        if self.current_contact_group is None:
-            self.select_contact_group(group_name)
-            return
-        
+
         # If clicking a different contact group, warn user
         if group_name != self.current_contact_group:
             messagebox.showwarning(
@@ -622,20 +655,7 @@ Tips:
                 "You can only tie contacts of the same type."
             )
             return
-        
-        # Find nearest point on the contact line
-        coords = polyline.get_coords()
-        nearest_idx = 0
-        min_pt_dist = float('inf')
-        
-        for i, (e, rl) in enumerate(coords):
-            dist = np.sqrt((e - click_x)**2 + (rl + y_offset - click_y)**2)
-            if dist < min_pt_dist:
-                min_pt_dist = dist
-                nearest_idx = i
-        
-        nearest_point = coords[nearest_idx]
-        
+
         if not self.drawing_tie:
             # Start a new tie line
             self.tie_line_start = TieLinePoint(
@@ -647,23 +667,26 @@ Tips:
                 vertex_idx=nearest_idx
             )
             self.drawing_tie = True
-            self.status_var.set(f"Tie started at N={int(northing)}, E={nearest_point[0]:.1f}. Click adjacent section to complete.")
-            
+            self.status_var.set(
+                f"Tie started at N={int(northing)}, E={nearest_point[0]:.1f} "
+                f"(snapped to node {nearest_idx}). Click adjacent section to complete."
+            )
+
             # Draw start point marker
             self.ax.plot(
                 nearest_point[0], nearest_point[1] + y_offset,
-                'o', color='red', markersize=10, zorder=20
+                'o', color='red', markersize=12, zorder=20
             )
             self.canvas.draw()
-            
+
         else:
             # Complete the tie line
             start = self.tie_line_start
-            
+
             # Validate: must be adjacent section
             start_idx = self.northings.index(start.northing) if start.northing in self.northings else -1
             end_idx = self.northings.index(northing) if northing in self.northings else -1
-            
+
             if abs(start_idx - end_idx) != 1:
                 messagebox.showwarning(
                     "Invalid Tie",
@@ -671,10 +694,10 @@ Tips:
                     "You cannot skip sections."
                 )
                 return
-            
+
             # Add the tie line to the group
             group = self.grouped_contacts[self.current_contact_group]
-            
+
             # Ensure from_northing > to_northing (north to south)
             if start.northing > northing:
                 group.tie_lines.append({
@@ -698,53 +721,95 @@ Tips:
                     "to_vertex_idx": start.vertex_idx,
                     "to_polyline_idx": start.polyline_idx
                 })
-            
+
             self.drawing_tie = False
             self.tie_line_start = None
-            
-            self.status_var.set(f"Tie line added to {self.current_contact_group}")
+
+            self.status_var.set(f"Tie line added to {self.current_contact_group} (snapped to nodes)")
             self.update_display()
             self.update_listbox_item()
             self.update_summary()
     
     def on_motion(self, event):
-        """Handle mouse motion for tie line preview."""
-        if not self.drawing_tie or self.tie_line_start is None:
-            return
-        
+        """Handle mouse motion for tie line preview and snap feedback."""
         if event.inaxes != self.ax:
+            # Remove snap highlight if moving outside plot
+            if self.snap_highlight is not None:
+                self.snap_highlight.remove()
+                self.snap_highlight = None
+                self.canvas.draw_idle()
             return
-        
+
+        # Remove previous snap highlight
+        if self.snap_highlight is not None:
+            self.snap_highlight.remove()
+            self.snap_highlight = None
+
+        # Show snap highlight when near a node (for active contact group)
+        if self.current_contact_group:
+            snap_target = self._find_snap_target(event.xdata, event.ydata)
+            if snap_target:
+                data, vertex_idx, snap_dist, (e, rl) = snap_target
+                y_offset = data['y_offset']
+                # Draw snap highlight
+                self.snap_highlight = self.ax.scatter(
+                    [e], [rl + y_offset],
+                    s=self.SNAP_HIGHLIGHT_SIZE,
+                    c=self.SNAP_HIGHLIGHT_COLOR,
+                    marker='o',
+                    alpha=0.6,
+                    zorder=25,
+                    edgecolors='white',
+                    linewidths=2
+                )
+
+        # Handle tie line preview (only when drawing)
+        if not self.drawing_tie or self.tie_line_start is None:
+            self.canvas.draw_idle()
+            return
+
         # Remove previous temp line
         if self.temp_tie_line is not None:
             self.temp_tie_line.remove()
             self.temp_tie_line = None
-        
+
         # Find the y_offset for the start section
         start_idx = self.current_center_section
         end_idx = min(start_idx + self.sections_to_display, len(self.northings))
         sections_to_show = self.northings[start_idx:end_idx]
-        
+
         rl_range = self.rl_max - self.rl_min
         section_spacing = rl_range * 1.2
-        
+
         start_y_offset = 0
         for idx, n in enumerate(sections_to_show):
             if abs(n - self.tie_line_start.northing) < 0.1:
                 start_y_offset = -idx * section_spacing
                 break
-        
+
+        # Determine end point - snap to node if within radius
+        end_x, end_y = event.xdata, event.ydata
+        line_color = 'gray'  # Gray when not snapped
+
+        snap_target = self._find_snap_target(event.xdata, event.ydata)
+        if snap_target:
+            data, vertex_idx, snap_dist, (e, rl) = snap_target
+            y_offset = data['y_offset']
+            end_x = e
+            end_y = rl + y_offset
+            line_color = 'green'  # Green when snapped to valid node
+
         # Draw temp line
         self.temp_tie_line, = self.ax.plot(
-            [self.tie_line_start.easting, event.xdata],
-            [self.tie_line_start.rl + start_y_offset, event.ydata],
-            color='red',
-            linewidth=1.5,
+            [self.tie_line_start.easting, end_x],
+            [self.tie_line_start.rl + start_y_offset, end_y],
+            color=line_color,
+            linewidth=2.0,
             linestyle=':',
-            alpha=0.7,
+            alpha=0.8,
             zorder=20
         )
-        
+
         self.canvas.draw_idle()
     
     def on_key(self, event):
@@ -760,6 +825,9 @@ Tips:
             if self.temp_tie_line is not None:
                 self.temp_tie_line.remove()
                 self.temp_tie_line = None
+            if self.snap_highlight is not None:
+                self.snap_highlight.remove()
+                self.snap_highlight = None
             self.status_var.set("Tie line cancelled")
             self.update_display()
     
