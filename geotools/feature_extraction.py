@@ -313,8 +313,9 @@ class FeatureExtractor:
                     logger.debug(f"Skipped annotation - filtered out group: {author}")
                     continue
 
-                # Check if this is a line/polyline (types 3, 9)
-                is_line_type = annot_type in [3, 9]  # Line, PolyLine
+                # Check if this is a line/polyline/ink (types 3, 7, 14)
+                # Type 3: Line, Type 7: PolyLine, Type 14: Ink (freehand drawing)
+                is_line_type = annot_type in [3, 7, 14]  # Line, PolyLine, Ink
 
                 # Check if this is a polygon type (types 4, 5, 6, 10)
                 is_polygon_type = annot_type in [4, 5, 6, 10]  # Square, Circle, Highlight, Polygon
@@ -385,11 +386,12 @@ class FeatureExtractor:
                             faults_found += 1
                             logger.debug(f"Extracted fault polygon: {fault_name} (author: {author})")
                         else:
-                            # Geological unit polygon - use author as formation name if no subject
-                            formation = self._get_formation_from_annot(annot, color)
+                            # Geological unit polygon - use subject as formation name
+                            formation, from_subject = self._get_formation_with_source(annot, color)
                             # If formation couldn't be determined from subject, use author
                             if formation == "UNIT" and author:
                                 formation = author.strip().upper()
+                                from_subject = True  # Treat author as explicit assignment
 
                             # Check for saved assignment from previous session
                             saved_assignment = self._get_saved_assignment(annot)
@@ -399,6 +401,7 @@ class FeatureExtractor:
                                 "vertices": vertices,
                                 "color": color,
                                 "formation": formation,
+                                "formation_from_subject": from_subject,  # True if explicitly set in PDF
                                 "unit_number": None,
                                 "classification": "UNIT",
                                 "source": "annotation",
@@ -407,7 +410,7 @@ class FeatureExtractor:
                             }
                             annotations.append(polygon_data)
                             polygons_found += 1
-                            logger.debug(f"Extracted polygon: {formation} (author: {author}, saved: {saved_assignment})")
+                            logger.debug(f"Extracted polygon: {formation} (author: {author}, from_subject: {from_subject}, saved: {saved_assignment})")
                     else:
                         skipped_too_few_points += 1
 
@@ -569,19 +572,30 @@ class FeatureExtractor:
 
     def _get_formation_from_annot(self, annot, color) -> str:
         """Get formation name from annotation or infer from color."""
+        formation, _ = self._get_formation_with_source(annot, color)
+        return formation
+
+    def _get_formation_with_source(self, annot, color) -> Tuple[str, bool]:
+        """
+        Get formation name from annotation or infer from color.
+
+        Returns:
+            Tuple of (formation_name, is_from_subject)
+            is_from_subject is True if the formation came from the PDF subject field
+        """
         if hasattr(annot, 'info'):
             info = annot.info
             subject = info.get('subject', '') or info.get('content', '')
             if subject and subject.strip():
                 # Check for saved assignment (from write_assignments_to_pdf)
                 if subject.startswith('Assigned:'):
-                    return subject[9:].strip().upper()  # Return saved assignment
+                    return subject[9:].strip().upper(), True  # Return saved assignment
                 # Don't use 'Fault' as formation name
                 if 'fault' not in subject.lower():
-                    return subject.strip().upper()
+                    return subject.strip().upper(), True
 
-        # Infer from color
-        return self._identify_formation(color)
+        # Infer from color (not from subject)
+        return self._identify_formation(color), False
 
     def _get_saved_assignment(self, annot) -> Optional[str]:
         """
