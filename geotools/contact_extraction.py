@@ -1433,12 +1433,12 @@ def extract_single_contact(
             sample_distance=2.0,
             fault_exclusion_distance=15.0
         )
-        
+
         if len(points) < 2:
             return None
-        
+
         vertices = coords_to_vertices(points)
-        
+
         return {
             'name': f"{name1}-{name2}",
             'unit1': name1,
@@ -1449,7 +1449,138 @@ def extract_single_contact(
             'northing': northing,
             'type': 'Contact'
         }
-        
+
     except Exception as e:
         logger.warning(f"Error extracting contact between {name1} and {name2}: {e}")
         return None
+
+
+def clip_contact_to_boundary(
+    contact_coords: List[Tuple[float, float]],
+    boundary_polygon: Polygon
+) -> List[Tuple[float, float]]:
+    """
+    Clip a contact line to a model boundary polygon.
+
+    This cleanly terminates the contact at the boundary edges,
+    eliminating hooks and artifacts at section edges.
+
+    Args:
+        contact_coords: List of (easting, rl) tuples
+        boundary_polygon: Shapely Polygon representing model boundary
+
+    Returns:
+        Clipped contact coordinates
+    """
+    if not boundary_polygon or len(contact_coords) < 2:
+        return contact_coords
+
+    try:
+        contact_line = LineString(contact_coords)
+        clipped = contact_line.intersection(boundary_polygon)
+
+        if clipped.is_empty:
+            return []
+
+        if clipped.geom_type == 'LineString':
+            return list(clipped.coords)
+        elif clipped.geom_type == 'MultiLineString':
+            # Return the longest continuous segment
+            longest = max(clipped.geoms, key=lambda g: g.length)
+            return list(longest.coords)
+        else:
+            return contact_coords
+
+    except Exception as e:
+        logger.warning(f"Error clipping contact to boundary: {e}")
+        return contact_coords
+
+
+def clip_contacts_to_boundary(
+    contacts: List[Dict],
+    boundary_polygon: Polygon
+) -> List[Dict]:
+    """
+    Clip multiple contacts to a model boundary.
+
+    Args:
+        contacts: List of contact dictionaries with 'vertices' key
+        boundary_polygon: Shapely Polygon for clipping
+
+    Returns:
+        List of contacts with clipped vertices
+    """
+    clipped_contacts = []
+
+    for contact in contacts:
+        vertices = contact.get('vertices', [])
+        coords = vertices_to_coords(vertices)
+
+        if len(coords) < 2:
+            continue
+
+        clipped_coords = clip_contact_to_boundary(coords, boundary_polygon)
+
+        if len(clipped_coords) >= 2:
+            new_contact = dict(contact)
+            new_contact['vertices'] = coords_to_vertices(clipped_coords)
+            clipped_contacts.append(new_contact)
+
+    return clipped_contacts
+
+
+def terminate_at_topography(
+    contact_coords: List[Tuple[float, float]],
+    topography_line: LineString,
+    tolerance: float = 5.0
+) -> List[Tuple[float, float]]:
+    """
+    Terminate a contact line where it meets the topography surface.
+
+    The contact should not extend above the topography.
+
+    Args:
+        contact_coords: List of (easting, rl) tuples
+        topography_line: LineString representing the surface
+        tolerance: Distance tolerance for termination
+
+    Returns:
+        Trimmed contact coordinates
+    """
+    if not topography_line or len(contact_coords) < 2:
+        return contact_coords
+
+    result = []
+
+    for i, (e, rl) in enumerate(contact_coords):
+        point = Point(e, rl)
+
+        # Check if this point is above topography
+        # Find nearest point on topography at same easting
+        try:
+            # Get topography RL at this easting by interpolation
+            topo_coords = list(topography_line.coords)
+            topo_rl = None
+
+            for j in range(len(topo_coords) - 1):
+                x1, y1 = topo_coords[j]
+                x2, y2 = topo_coords[j + 1]
+
+                # Check if easting is within this segment
+                if min(x1, x2) <= e <= max(x1, x2):
+                    if abs(x2 - x1) > 0.001:
+                        t = (e - x1) / (x2 - x1)
+                        topo_rl = y1 + t * (y2 - y1)
+                        break
+
+            if topo_rl is not None:
+                # If contact point is above topography, skip it
+                if rl > topo_rl + tolerance:
+                    continue
+
+            result.append((e, rl))
+
+        except Exception:
+            result.append((e, rl))
+
+    return result
