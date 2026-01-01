@@ -1,0 +1,52 @@
+{
+    "name": "Cross-Section-Tool",
+    "image": "mcr.microsoft.com/devcontainers/python:3.11",
+
+    "features": {
+        "ghcr.io/devcontainers/features/desktop-lite:1": {
+            "password": "vscode",
+            "webPort": "6080",
+            "vncPort": "5901"
+        },
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+
+    "postCreateCommand": "bash .devcontainer/setup.sh",
+
+    "forwardPorts": [6080, 5901],
+
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.black-formatter",
+                "ms-python.flake8",
+                "charliermarsh.ruff"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/home/vscode/.venv/bin/python",
+                "python.terminal.activateEnvironment": true,
+                "editor.formatOnSave": true,
+                "python.testing.pytestEnabled": true,
+                "python.testing.pytestArgs": ["tests"]
+            }
+        }
+    },
+
+    "remoteUser": "vscode",
+
+    "containerEnv": {
+        "DISPLAY": ":1"
+    },
+
+    "portsAttributes": {
+        "6080": {
+            "label": "Desktop (noVNC)",
+            "onAutoForward": "openBrowser"
+        },
+        "5901": {
+            "label": "Desktop (VNC)"
+        }
+    }
+}
