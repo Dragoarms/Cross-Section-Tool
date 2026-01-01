@@ -43,7 +43,7 @@ from .pdf_calibration import PDFCalibrationDialog, ExtractionFilter, open_calibr
 from .contact_extraction import ContactExtractor, GroupedContact, extract_contacts_grouped
 from .tie_line_editor import TieLineEditor, open_tie_line_editor
 from .pdf_annotation_writer import PDFAnnotationWriter, write_assignments_batch
-from .model_boundary import extract_model_boundary, ModelBoundary
+from .model_boundary import extract_model_boundary, create_model_boundary_from_coord_system, ModelBoundary
 
 # Configure logging
 logging.basicConfig(
@@ -109,7 +109,9 @@ class GeologicalCrossSectionGUI:
         self.selected_units = set()  # Selected units for assignment
         self.unit_patches = {}  # Maps matplotlib patches to unit data
         self.polyline_patches = {}  # Maps matplotlib lines to polyline data
+        self.contact_patches = {}  # Maps matplotlib lines to contact data
         self.selected_polylines = set()  # Selected polylines for fault assignment
+        self.selected_contacts = set()  # Selected contacts (group names)
         
         # Classification mode state
         self.classification_mode = "none"  # "none", "polygon", "fault"
@@ -790,14 +792,15 @@ class GeologicalCrossSectionGUI:
                 if unit_data.get("unit_assignment"):
                     unit_assignments[unit_name] = unit_data["unit_assignment"]
             
-            # Use new contact extractor
+            # Use new contact extractor (with model boundaries for clean termination)
             self.grouped_contacts = extract_contacts_grouped(
                 all_sections_data=self.all_sections_data,
                 unit_assignments=unit_assignments,
                 sample_distance=2.0,
                 proximity_threshold=10.0,
                 min_contact_length=5.0,
-                simplify_tolerance=1.0
+                simplify_tolerance=1.0,
+                model_boundaries=self.model_boundaries
             )
             
             # Also populate legacy all_contacts for backward compatibility
@@ -1965,12 +1968,13 @@ class GeologicalCrossSectionGUI:
                         self.georeferencer.coord_system = coord_system
                         transform = self.georeferencer.build_transformation()
 
-                    # Extract model boundary if we have a transform
+                    # Extract model boundary using coord_system bounds (more accurate than path detection)
                     if transform and coord_system:
                         try:
                             section_northing_val = coord_system.get("northing", 0.0)
                             transform_func = lambda x, y: (transform(x, y)[0], transform(x, y)[2])  # (easting, rl)
-                            model_boundary = extract_model_boundary(
+                            model_boundary = create_model_boundary_from_coord_system(
+                                coord_system=coord_system,
                                 page=page,
                                 transform_func=transform_func,
                                 northing=section_northing_val,
@@ -2099,12 +2103,18 @@ class GeologicalCrossSectionGUI:
                         }
                         
                         # Use new grouped contact extractor
+                        # Build temp model_boundaries dict for this section
+                        temp_model_boundaries = {}
+                        if section_northing_val in self.model_boundaries:
+                            temp_model_boundaries[section_northing] = self.model_boundaries[section_northing_val]
+
                         grouped = extract_contacts_grouped(
                             temp_section_data,
                             sample_distance=2.0,
                             proximity_threshold=10.0,
                             min_contact_length=5.0,
-                            simplify_tolerance=1.0
+                            simplify_tolerance=1.0,
+                            model_boundaries=temp_model_boundaries
                         )
                         
                         # Flatten grouped contacts to list format
@@ -2285,6 +2295,8 @@ class GeologicalCrossSectionGUI:
 
         self.fig_sections.clear()
         self.unit_patches.clear()
+        self.polyline_patches.clear()
+        self.contact_patches.clear()
 
         if not self.northings:
             self.canvas_sections.draw()
@@ -2513,25 +2525,44 @@ class GeologicalCrossSectionGUI:
                                 x = [vertices[j] for j in range(0, len(vertices), 2)]
                                 z = [vertices[j + 1] for j in range(0, len(vertices), 2)]
 
+                                # Check if contact is selected
+                                is_selected = group_name in self.selected_contacts
+
                                 # Apply transparency based on classification mode
                                 mode = getattr(self, 'classification_mode', 'none')
                                 if mode == 'polygon' or mode == 'fault':
                                     contact_alpha = 0.3
                                     contact_width = 1.5
+                                    contact_color = '#888888'
+                                elif is_selected:
+                                    contact_alpha = 1.0
+                                    contact_width = 4.0
+                                    contact_color = '#FF00FF'  # Magenta for selected
                                 else:
                                     contact_alpha = 0.9
                                     contact_width = 2.5
+                                    contact_color = '#00AA00'  # Green
 
-                                # Draw contact as green dashed line
-                                ax.plot(
+                                # Draw contact line (pickable in contact mode)
+                                contact_line = ax.plot(
                                     x, z,
-                                    color='#00AA00',  # Green
+                                    color=contact_color,
                                     linewidth=contact_width,
                                     linestyle='-',
                                     alpha=contact_alpha,
-                                    zorder=8,  # Below faults but above polygons
-                                    label=f"Contact: {group_name}" if i == 0 else None,
-                                )
+                                    zorder=11 if is_selected else 8,
+                                    picker=8 if mode == 'contact' else False,
+                                )[0]
+
+                                # Store for selection handling
+                                self.contact_patches[contact_line] = {
+                                    "group_name": group_name,
+                                    "formation1": group.formation1,
+                                    "formation2": group.formation2,
+                                    "vertices": vertices,
+                                    "northing": northing,
+                                    "polyline": polyline,
+                                }
 
             # Draw model boundary if available and enabled
             if self.show_boundaries_var.get() and northing in self.model_boundaries:
@@ -5284,9 +5315,37 @@ class GeologicalCrossSectionGUI:
                     else:
                         self.selected_polylines.add(polyline_name)
                         self.status_var.set(f"Selected: {polyline_name}")
-                    
+
                     self.update_selection_display()
                     self.update_section_display()
+
+        elif event.artist in self.contact_patches:
+            contact_data = self.contact_patches[event.artist]
+            group_name = contact_data.get("group_name", "Unknown")
+            formation1 = contact_data.get("formation1", "")
+            formation2 = contact_data.get("formation2", "")
+            contact_display = f"{formation1}-{formation2}" if formation1 and formation2 else group_name
+
+            # Right-click could be used for future contact operations
+            if is_right_click:
+                self.status_var.set(f"Contact: {contact_display}")
+                return
+
+            # Check classification mode
+            if self.classification_mode != "contact":
+                self.status_var.set(f"Contact: {contact_display} (Switch to Contact mode to interact)")
+                return
+
+            # Contact mode - toggle selection
+            if group_name in self.selected_contacts:
+                self.selected_contacts.discard(group_name)
+                self.status_var.set(f"Deselected contact: {contact_display}")
+            else:
+                self.selected_contacts.add(group_name)
+                self.status_var.set(f"Selected contact: {contact_display}")
+
+            self.update_selection_display()
+            self.update_section_display()
 
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""
@@ -5340,15 +5399,27 @@ class GeologicalCrossSectionGUI:
                 pass
         
         if found_feature:
-            # Build tooltip text
-            name = found_feature.get('name', 'Unknown')
-            assignment = found_feature.get('assignment') or found_feature.get('fault_assignment')
-            display = found_feature.get('display_name', name)
-            
-            if assignment:
-                tooltip_text = f"{display}\n({name})"
+            # Build tooltip text based on feature type
+            feature_type = found_feature.get('_feature_type', 'unknown')
+
+            if feature_type == 'contact':
+                group_name = found_feature.get('group_name', 'Unknown')
+                formation1 = found_feature.get('formation1', '')
+                formation2 = found_feature.get('formation2', '')
+                northing = found_feature.get('northing', 0)
+                if formation1 and formation2:
+                    tooltip_text = f"Contact: {formation1}-{formation2}\nSection: N{int(northing)}"
+                else:
+                    tooltip_text = f"Contact: {group_name}\nSection: N{int(northing)}"
             else:
-                tooltip_text = f"{name}\n(Unassigned)"
+                name = found_feature.get('name', 'Unknown')
+                assignment = found_feature.get('assignment') or found_feature.get('fault_assignment')
+                display = found_feature.get('display_name', name)
+
+                if assignment:
+                    tooltip_text = f"{display}\n({name})"
+                else:
+                    tooltip_text = f"{name}\n(Unassigned)"
             
             # Always recreate annotation on hover (avoids axes mismatch issues)
             # Hide old one first
@@ -5640,23 +5711,55 @@ class GeologicalCrossSectionGUI:
         self.update_3d_view()
 
     def select_similar(self):
-        """Select units with similar properties."""
-        if not self.selected_units:
-            messagebox.showinfo("No Selection", "Please select at least one unit first")
-            return
+        """Select units/contacts with similar properties based on current mode."""
+        mode = getattr(self, 'classification_mode', 'none')
 
-        selected_formations = set()
-        for unit_name in self.selected_units:
-            if unit_name in self.all_geological_units:
-                unit = self.all_geological_units[unit_name]
-                selected_formations.add(unit.get("formation", "UNIT"))
+        # Contact mode - select all contacts with same formation pair
+        if mode == 'contact':
+            if not self.selected_contacts:
+                messagebox.showinfo("No Selection", "Please select at least one contact first")
+                return
 
-        new_selections = set()
-        for unit_name, unit in self.all_geological_units.items():
-            if unit.get("formation", "UNIT") in selected_formations:
-                new_selections.add(unit_name)
+            # Get formation pairs from selected contacts
+            selected_pairs = set()
+            for group_name in self.selected_contacts:
+                if group_name in self.grouped_contacts:
+                    group = self.grouped_contacts[group_name]
+                    pair = (group.formation1, group.formation2)
+                    selected_pairs.add(pair)
+                    # Also add reverse pair since contacts are bidirectional
+                    selected_pairs.add((group.formation2, group.formation1))
 
-        self.selected_units = new_selections
+            # Select all contacts with matching formation pairs
+            new_selections = set()
+            for group_name, group in self.grouped_contacts.items():
+                pair = (group.formation1, group.formation2)
+                if pair in selected_pairs:
+                    new_selections.add(group_name)
+
+            self.selected_contacts = new_selections
+            count = len(new_selections)
+            self.status_var.set(f"Selected {count} contact groups with similar formations")
+
+        # Polygon mode - existing behavior
+        else:
+            if not self.selected_units:
+                messagebox.showinfo("No Selection", "Please select at least one unit first")
+                return
+
+            selected_formations = set()
+            for unit_name in self.selected_units:
+                if unit_name in self.all_geological_units:
+                    unit = self.all_geological_units[unit_name]
+                    selected_formations.add(unit.get("formation", "UNIT"))
+
+            new_selections = set()
+            for unit_name, unit in self.all_geological_units.items():
+                if unit.get("formation", "UNIT") in selected_formations:
+                    new_selections.add(unit_name)
+
+            self.selected_units = new_selections
+
         self.update_selection_display()
         self.update_section_display()
         self.update_3d_view()
