@@ -1069,11 +1069,13 @@ class GeologicalCrossSectionGUI:
         ttk.Button(action_frame, text="Clear Ties", command=self.tie_clear_for_group).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_frame, text="Accept All", command=self.tie_accept_suggestions).pack(side=tk.LEFT, padx=2)
 
-        # Export
-        export_frame = ttk.LabelFrame(control_frame, text="Export", padding=3)
+        # Export/Save
+        export_frame = ttk.LabelFrame(control_frame, text="Save/Load", padding=3)
         export_frame.pack(side=tk.LEFT, padx=5)
 
-        ttk.Button(export_frame, text="Contacts + Ties DXF", command=self.export_contacts_dxf).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_frame, text="Save to PDF", command=self.save_tie_lines_to_pdf).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_frame, text="Load from PDF", command=self.load_tie_lines_from_pdfs).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_frame, text="Export DXF", command=self.export_contacts_dxf).pack(side=tk.LEFT, padx=2)
 
         # Status label
         self.tie_status_label = ttk.Label(control_frame, text="Select a contact group", 
@@ -1857,6 +1859,315 @@ class GeologicalCrossSectionGUI:
         except Exception as e:
             logger.error(f"Export failed: {e}", exc_info=True)
             messagebox.showerror("Error", f"Export failed: {e}")
+
+    def save_tie_lines_to_pdf(self):
+        """
+        Save tie line markers to PDFs as circle annotations.
+
+        Each tie line point is saved as a circle annotation with subject:
+        "TieLine:GroupName:TieID:from" or "TieLine:GroupName:TieID:to"
+
+        The circle marks the location on the contact where the tie connects.
+        """
+        if not self.grouped_contacts:
+            messagebox.showwarning("No Data", "No contacts extracted.")
+            return
+
+        total_ties = sum(len(g.tie_lines) for g in self.grouped_contacts.values())
+        if total_ties == 0:
+            messagebox.showwarning("No Ties", "No tie lines to save.")
+            return
+
+        try:
+            ties_saved = 0
+            pdfs_modified = set()
+
+            for group_name, group in self.grouped_contacts.items():
+                for tie_idx, tie in enumerate(group.tie_lines):
+                    from_point = tie.get('from_point')
+                    to_point = tie.get('to_point')
+                    from_northing = tie.get('from_northing')
+                    to_northing = tie.get('to_northing')
+
+                    if not from_point or not to_point:
+                        continue
+
+                    # Save "from" point
+                    saved_from = self._save_tie_point_to_pdf(
+                        group_name, tie_idx, "from",
+                        from_northing, from_point[0], from_point[1]
+                    )
+                    if saved_from:
+                        pdfs_modified.add(saved_from)
+
+                    # Save "to" point
+                    saved_to = self._save_tie_point_to_pdf(
+                        group_name, tie_idx, "to",
+                        to_northing, to_point[0], to_point[1]
+                    )
+                    if saved_to:
+                        pdfs_modified.add(saved_to)
+
+                    ties_saved += 1
+
+            # Save all modified PDFs
+            for pdf_path in pdfs_modified:
+                try:
+                    doc = fitz.open(pdf_path)
+                    doc.save(pdf_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+                    doc.close()
+                except Exception as e:
+                    logger.warning(f"Could not save PDF {pdf_path}: {e}")
+
+            self.status_var.set(f"Saved {ties_saved} tie lines to {len(pdfs_modified)} PDFs")
+            messagebox.showinfo("Save Complete", f"Saved {ties_saved} tie lines to PDFs")
+
+        except Exception as e:
+            logger.error(f"Save tie lines failed: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Save failed: {e}")
+
+    def _save_tie_point_to_pdf(self, group_name: str, tie_idx: int, point_type: str,
+                               northing: float, easting: float, rl: float) -> Optional[str]:
+        """
+        Save a single tie point as a circle annotation in the appropriate PDF.
+
+        Returns the PDF path if successful, None otherwise.
+        """
+        # Find the PDF and page for this northing
+        pdf_info = self._find_pdf_for_northing(northing)
+        if not pdf_info:
+            logger.warning(f"No PDF found for northing {northing}")
+            return None
+
+        pdf_path, page_num, section_data = pdf_info
+
+        # Get the coordinate transform for this section
+        transform = section_data.get('transform')
+        if not transform:
+            logger.warning(f"No transform for section at northing {northing}")
+            return None
+
+        # Convert section coordinates to PDF coordinates
+        try:
+            # Need inverse transform: section coords -> PDF coords
+            inverse_transform = section_data.get('inverse_transform')
+            if inverse_transform:
+                pdf_x, pdf_y = inverse_transform(easting, rl)
+            else:
+                # Fallback: try to compute from transform matrix
+                logger.warning(f"No inverse transform for northing {northing}")
+                return None
+        except Exception as e:
+            logger.warning(f"Transform failed: {e}")
+            return None
+
+        # Create circle annotation
+        try:
+            doc = fitz.open(pdf_path)
+            page = doc[page_num]
+
+            # Create subject string for identification
+            subject = f"TieLine:{group_name}:{tie_idx}:{point_type}"
+
+            # Circle annotation radius (in PDF points)
+            radius = 8
+
+            # Create annotation rect
+            rect = fitz.Rect(
+                pdf_x - radius, pdf_y - radius,
+                pdf_x + radius, pdf_y + radius
+            )
+
+            # Add circle annotation
+            annot = page.add_circle_annot(rect)
+            annot.set_info(subject=subject, content=f"Tie line marker for {group_name}")
+            annot.set_colors(stroke=(1, 0, 0), fill=(1, 0.5, 0))  # Red/orange
+            annot.set_border(width=2)
+            annot.set_opacity(0.8)
+            annot.update()
+
+            doc.close()
+            logger.debug(f"Saved tie point: {subject} at ({pdf_x:.1f}, {pdf_y:.1f})")
+            return pdf_path
+
+        except Exception as e:
+            logger.error(f"Failed to save tie annotation: {e}")
+            return None
+
+    def _find_pdf_for_northing(self, northing: float, tolerance: float = 0.1) -> Optional[Tuple]:
+        """Find the PDF path, page number, and section data for a given northing."""
+        for (pdf_path, page_num), section_data in self.all_sections_data.items():
+            section_northing = section_data.get('northing')
+            if section_northing and abs(section_northing - northing) < tolerance:
+                return (pdf_path, page_num, section_data)
+        return None
+
+    def load_tie_lines_from_pdfs(self):
+        """
+        Load tie line markers from PDFs.
+
+        Reads circle annotations with subject starting with "TieLine:"
+        and reconstructs the tie lines.
+        """
+        if not self.all_sections_data:
+            messagebox.showwarning("No Data", "No PDFs loaded.")
+            return
+
+        if not self.grouped_contacts:
+            messagebox.showwarning("No Contacts", "Extract contacts first before loading tie lines.")
+            return
+
+        try:
+            ties_loaded = 0
+            tie_points = {}  # {(group_name, tie_idx): {'from': point, 'to': point, 'from_northing': n, 'to_northing': n}}
+
+            # Scan all loaded PDFs for tie line annotations
+            for (pdf_path, page_num), section_data in self.all_sections_data.items():
+                northing = section_data.get('northing')
+                transform = section_data.get('transform')
+
+                if not northing or not transform:
+                    continue
+
+                try:
+                    doc = fitz.open(pdf_path)
+                    page = doc[page_num]
+
+                    for annot in page.annots():
+                        if annot.type[0] != 5:  # 5 = Circle annotation
+                            continue
+
+                        info = annot.info
+                        subject = info.get('subject', '')
+
+                        if not subject.startswith('TieLine:'):
+                            continue
+
+                        # Parse subject: TieLine:GroupName:TieIdx:from/to
+                        parts = subject.split(':')
+                        if len(parts) < 4:
+                            continue
+
+                        group_name = parts[1]
+                        try:
+                            tie_idx = int(parts[2])
+                        except ValueError:
+                            continue
+                        point_type = parts[3]  # 'from' or 'to'
+
+                        # Get annotation center in PDF coordinates
+                        rect = annot.rect
+                        pdf_x = (rect.x0 + rect.x1) / 2
+                        pdf_y = (rect.y0 + rect.y1) / 2
+
+                        # Transform to section coordinates
+                        try:
+                            section_x, section_y = transform(pdf_x, pdf_y)
+                        except Exception as e:
+                            logger.warning(f"Transform failed for tie point: {e}")
+                            continue
+
+                        # Store the point
+                        key = (group_name, tie_idx)
+                        if key not in tie_points:
+                            tie_points[key] = {}
+
+                        if point_type == 'from':
+                            tie_points[key]['from'] = (section_x, section_y)
+                            tie_points[key]['from_northing'] = northing
+                        elif point_type == 'to':
+                            tie_points[key]['to'] = (section_x, section_y)
+                            tie_points[key]['to_northing'] = northing
+
+                    doc.close()
+
+                except Exception as e:
+                    logger.warning(f"Error reading PDF {pdf_path}: {e}")
+                    continue
+
+            # Reconstruct tie lines
+            for (group_name, tie_idx), data in tie_points.items():
+                if 'from' not in data or 'to' not in data:
+                    logger.warning(f"Incomplete tie line: {group_name}:{tie_idx}")
+                    continue
+
+                # Find or skip if group doesn't exist
+                if group_name not in self.grouped_contacts:
+                    logger.warning(f"Unknown contact group: {group_name}")
+                    continue
+
+                group = self.grouped_contacts[group_name]
+
+                # Check if this tie already exists
+                tie_exists = False
+                for existing_tie in group.tie_lines:
+                    if (abs(existing_tie.get('from_northing', 0) - data['from_northing']) < 0.1 and
+                        abs(existing_tie.get('to_northing', 0) - data['to_northing']) < 0.1):
+                        # Similar tie exists, skip
+                        tie_exists = True
+                        break
+
+                if not tie_exists:
+                    group.tie_lines.append({
+                        'from_northing': data['from_northing'],
+                        'from_point': data['from'],
+                        'to_northing': data['to_northing'],
+                        'to_point': data['to']
+                    })
+                    ties_loaded += 1
+                    logger.debug(f"Loaded tie: {group_name} N{data['from_northing']:.0f} -> N{data['to_northing']:.0f}")
+
+            self.status_var.set(f"Loaded {ties_loaded} tie lines from PDFs")
+            if ties_loaded > 0:
+                self.update_tie_summary()
+                messagebox.showinfo("Load Complete", f"Loaded {ties_loaded} tie lines from PDFs")
+            else:
+                messagebox.showinfo("No Ties Found", "No tie line markers found in the PDFs")
+
+        except Exception as e:
+            logger.error(f"Load tie lines failed: {e}", exc_info=True)
+            messagebox.showerror("Error", f"Load failed: {e}")
+
+    def clear_tie_line_annotations(self):
+        """Remove all tie line annotations from PDFs."""
+        if not self.all_sections_data:
+            return
+
+        try:
+            removed_count = 0
+            pdfs_modified = set()
+
+            for (pdf_path, page_num), section_data in self.all_sections_data.items():
+                try:
+                    doc = fitz.open(pdf_path)
+                    page = doc[page_num]
+
+                    # Find and remove tie line annotations
+                    annots_to_remove = []
+                    for annot in page.annots():
+                        info = annot.info
+                        subject = info.get('subject', '')
+                        if subject.startswith('TieLine:'):
+                            annots_to_remove.append(annot)
+
+                    for annot in annots_to_remove:
+                        page.delete_annot(annot)
+                        removed_count += 1
+
+                    if annots_to_remove:
+                        pdfs_modified.add(pdf_path)
+                        doc.save(pdf_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+
+                    doc.close()
+
+                except Exception as e:
+                    logger.warning(f"Error cleaning PDF {pdf_path}: {e}")
+
+            if removed_count > 0:
+                self.status_var.set(f"Removed {removed_count} tie line markers from {len(pdfs_modified)} PDFs")
+
+        except Exception as e:
+            logger.error(f"Clear tie annotations failed: {e}")
 
     # Part 4: 3D Visualization Tab
     def create_3d_tab(self):
