@@ -177,6 +177,44 @@ class ContactMidpoint(NamedTuple):
     distance: float  # Distance between the two boundary points
 
 
+def _get_exterior_rings(geom) -> List[LineString]:
+    """
+    Get exterior ring(s) from a geometry, handling both Polygon and MultiPolygon.
+
+    Args:
+        geom: A Shapely Polygon or MultiPolygon
+
+    Returns:
+        List of exterior rings as LineStrings
+    """
+    from shapely.geometry import Polygon, MultiPolygon
+
+    if geom is None or geom.is_empty:
+        return []
+
+    if isinstance(geom, Polygon):
+        if geom.exterior:
+            return [geom.exterior]
+        return []
+    elif isinstance(geom, MultiPolygon):
+        exteriors = []
+        for poly in geom.geoms:
+            if poly.exterior:
+                exteriors.append(poly.exterior)
+        return exteriors
+    else:
+        # Try to handle other geometry types gracefully
+        if hasattr(geom, 'exterior'):
+            return [geom.exterior]
+        return []
+
+
+def _is_polygon_like(geom) -> bool:
+    """Check if geometry is a Polygon or MultiPolygon."""
+    from shapely.geometry import Polygon, MultiPolygon
+    return isinstance(geom, (Polygon, MultiPolygon))
+
+
 # =============================================================================
 # Geometry Utility Functions
 # =============================================================================
@@ -245,57 +283,65 @@ def _angle_between_vectors(v1: Tuple[float, float], v2: Tuple[float, float]) -> 
 # =============================================================================
 
 def _sample_polygon_boundary(
-    polygon: Polygon,
+    polygon,
     unit_name: str,
     poly_index: int,
     sample_distance: float = 2.0
 ) -> List[BoundaryPoint]:
     """
     Sample points along a polygon boundary at regular intervals.
-    
+
     Args:
-        polygon: Shapely Polygon
+        polygon: Shapely Polygon or MultiPolygon
         unit_name: Name of the geological unit
         poly_index: Index of this polygon within the unit
         sample_distance: Distance between sample points in map units
-    
+
     Returns:
         List of BoundaryPoint objects
     """
+    from shapely.geometry import MultiPolygon
+
     points = []
-    
-    if polygon.is_empty or not polygon.exterior:
+
+    if polygon is None or polygon.is_empty:
         return points
-    
-    exterior = polygon.exterior
-    coords = list(exterior.coords)
-    n = len(coords)
-    
-    if n < 3:
+
+    # Get all exterior rings (handles both Polygon and MultiPolygon)
+    exterior_rings = _get_exterior_rings(polygon)
+
+    if not exterior_rings:
         return points
-    
-    for i in range(n - 1):  # -1 because last point duplicates first in closed ring
-        p1 = coords[i]
-        p2 = coords[i + 1]
-        
-        seg_len = _point_distance(p1, p2)
-        if seg_len < 0.001:
+
+    for exterior in exterior_rings:
+        coords = list(exterior.coords)
+        n = len(coords)
+
+        if n < 3:
             continue
-        
-        num_samples = max(1, int(math.ceil(seg_len / sample_distance)))
-        
-        for j in range(num_samples):
-            t = j / num_samples
-            x = p1[0] + (p2[0] - p1[0]) * t
-            y = p1[1] + (p2[1] - p1[1]) * t
-            
-            points.append(BoundaryPoint(
-                x=x,
-                y=y,
-                unit_name=unit_name,
-                poly_index=poly_index
-            ))
-    
+
+        for i in range(n - 1):  # -1 because last point duplicates first in closed ring
+            p1 = coords[i]
+            p2 = coords[i + 1]
+
+            seg_len = _point_distance(p1, p2)
+            if seg_len < 0.001:
+                continue
+
+            num_samples = max(1, int(math.ceil(seg_len / sample_distance)))
+
+            for j in range(num_samples):
+                t = j / num_samples
+                x = p1[0] + (p2[0] - p1[0]) * t
+                y = p1[1] + (p2[1] - p1[1]) * t
+
+                points.append(BoundaryPoint(
+                    x=x,
+                    y=y,
+                    unit_name=unit_name,
+                    poly_index=poly_index
+                ))
+
     return points
 
 
@@ -1354,16 +1400,36 @@ class ContactExtractor:
                 if poly1.distance(poly2) > self.proximity_threshold:
                     continue
                 
-                # Extract contact points
-                points = extract_contact_points(
-                    boundary1=poly1.exterior,
-                    boundary2=poly2.exterior,
-                    fault_lines=fault_geometries if fault_geometries else None,
-                    proximity_threshold=self.proximity_threshold,
-                    sample_distance=self.sample_distance,
-                    fault_exclusion_distance=self.fault_exclusion_distance
-                )
-                
+                # Get exterior rings (handles both Polygon and MultiPolygon)
+                exteriors1 = _get_exterior_rings(poly1)
+                exteriors2 = _get_exterior_rings(poly2)
+
+                if not exteriors1 or not exteriors2:
+                    continue
+
+                # Extract contact points from all combinations of exterior rings
+                all_points = []
+                for ext1 in exteriors1:
+                    for ext2 in exteriors2:
+                        pts = extract_contact_points(
+                            boundary1=ext1,
+                            boundary2=ext2,
+                            fault_lines=fault_geometries if fault_geometries else None,
+                            proximity_threshold=self.proximity_threshold,
+                            sample_distance=self.sample_distance,
+                            fault_exclusion_distance=self.fault_exclusion_distance
+                        )
+                        all_points.extend(pts)
+
+                # Remove duplicates and clean
+                if all_points:
+                    all_points = _remove_duplicate_points(all_points, tolerance=self.sample_distance / 3)
+                    if len(all_points) > 2:
+                        all_points = _sort_points_nearest_neighbor(all_points, max_gap=50.0)
+                        all_points = _clean_polyline(all_points, simplify_tolerance=self.simplify_tolerance)
+
+                points = all_points
+
                 if len(points) < 2:
                     continue
 
@@ -1584,8 +1650,8 @@ def extract_contacts_grouped(
 
 
 def extract_single_contact(
-    poly1: Polygon,
-    poly2: Polygon,
+    poly1,
+    poly2,
     name1: str,
     name2: str,
     form1: str,
@@ -1597,21 +1663,43 @@ def extract_single_contact(
 ) -> Optional[Dict]:
     """
     Extract a single contact between two polygons.
-    
+
     Convenience function for section_viewer and other modules.
-    
+    Handles both Polygon and MultiPolygon geometries.
+
     Returns:
         Contact dictionary or None if no contact found
     """
     try:
-        points = extract_contact_points(
-            boundary1=poly1.exterior,
-            boundary2=poly2.exterior,
-            fault_lines=fault_lines,
-            proximity_threshold=buffer_distance,
-            sample_distance=2.0,
-            fault_exclusion_distance=15.0
-        )
+        # Get exterior rings (handles both Polygon and MultiPolygon)
+        exteriors1 = _get_exterior_rings(poly1)
+        exteriors2 = _get_exterior_rings(poly2)
+
+        if not exteriors1 or not exteriors2:
+            return None
+
+        # Extract contact points from all combinations of exterior rings
+        all_points = []
+        for ext1 in exteriors1:
+            for ext2 in exteriors2:
+                pts = extract_contact_points(
+                    boundary1=ext1,
+                    boundary2=ext2,
+                    fault_lines=fault_lines,
+                    proximity_threshold=buffer_distance,
+                    sample_distance=2.0,
+                    fault_exclusion_distance=15.0
+                )
+                all_points.extend(pts)
+
+        # Remove duplicates and clean
+        if all_points:
+            all_points = _remove_duplicate_points(all_points, tolerance=2.0 / 3)
+            if len(all_points) > 2:
+                all_points = _sort_points_nearest_neighbor(all_points, max_gap=50.0)
+                all_points = _clean_polyline(all_points, simplify_tolerance=simplify_tolerance)
+
+        points = all_points
 
         if len(points) < 2:
             return None
