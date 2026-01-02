@@ -6031,6 +6031,7 @@ class GeologicalCrossSectionGUI:
 
         ttk.Button(action_frame, text="Finish Draw", command=self._finish_drawing, width=10).pack(side=tk.LEFT, padx=2)
         ttk.Button(action_frame, text="Cancel", command=self._cancel_drawing, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="Simplify", command=self._simplify_contact_dialog, width=7).pack(side=tk.LEFT, padx=2)
 
         # Keybinds info
         info_frame = ttk.LabelFrame(self.contact_edit_toolbar, text="Keybinds", padding=2)
@@ -6714,6 +6715,14 @@ class GeologicalCrossSectionGUI:
                 polyline.vertices = vertices
             self.status_var.set(f"Undo: node moved back to original position")
 
+        elif action_type == 'simplify_contact':
+            # Undo simplify = restore original vertices
+            old_vertices = data['old_vertices']
+            # Save current for redo
+            data['new_vertices'] = list(polyline.vertices)
+            polyline.vertices = old_vertices
+            self.status_var.set(f"Undo: restored original contact shape")
+
         # Push to redo stack
         if not hasattr(self, 'contact_redo_stack'):
             self.contact_redo_stack = []
@@ -6779,6 +6788,13 @@ class GeologicalCrossSectionGUI:
                 vertices[vert_idx + 1] = new_y
                 polyline.vertices = vertices
             self.status_var.set(f"Redo: node relocated")
+
+        elif action_type == 'simplify_contact':
+            # Redo simplify = re-apply simplified vertices
+            new_vertices = data.get('new_vertices')
+            if new_vertices:
+                polyline.vertices = new_vertices
+                self.status_var.set(f"Redo: re-applied simplification")
 
         # Push back to undo stack
         self.contact_undo_stack.append((action_type, data))
@@ -7060,6 +7076,129 @@ class GeologicalCrossSectionGUI:
         # Node is still in place, we just clear the visual indicator
         # No actual restoration needed since we didn't modify the polyline yet
         pass
+
+    def _simplify_contact_dialog(self):
+        """Show dialog to simplify a contact line, reducing node count while preserving shape."""
+        from tkinter import simpledialog
+
+        # Get list of all contacts
+        contact_names = []
+        contact_node_counts = {}
+        for scatter_id, node_data in self.contact_node_patches.items():
+            group_name = node_data.get('group_name', '')
+            x_coords = node_data.get('x_coords', [])
+            if group_name and x_coords:
+                contact_names.append(group_name)
+                contact_node_counts[group_name] = len(x_coords)
+
+        if not contact_names:
+            self.status_var.set("No contacts available to simplify")
+            return
+
+        # Create dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Simplify Contact")
+        dialog.geometry("400x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Contact selection
+        ttk.Label(dialog, text="Select contact:").pack(pady=(10, 5))
+        contact_var = tk.StringVar(value=contact_names[0] if contact_names else "")
+        contact_combo = ttk.Combobox(dialog, textvariable=contact_var, values=contact_names, state='readonly', width=40)
+        contact_combo.pack(pady=5)
+
+        # Node count info
+        info_var = tk.StringVar()
+        info_label = ttk.Label(dialog, textvariable=info_var)
+        info_label.pack(pady=5)
+
+        def update_info(*args):
+            name = contact_var.get()
+            count = contact_node_counts.get(name, 0)
+            info_var.set(f"Current nodes: {count}")
+        contact_var.trace('w', update_info)
+        update_info()
+
+        # Target node count
+        ttk.Label(dialog, text="Target node count (0 = auto):").pack(pady=(10, 5))
+        target_var = tk.StringVar(value="0")
+        target_entry = ttk.Entry(dialog, textvariable=target_var, width=10)
+        target_entry.pack(pady=5)
+
+        # Buttons
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=15)
+
+        def do_simplify():
+            name = contact_var.get()
+            try:
+                target = int(target_var.get())
+            except ValueError:
+                target = 0
+            dialog.destroy()
+            self._simplify_contact(name, target)
+
+        ttk.Button(btn_frame, text="Simplify", command=do_simplify).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=10)
+
+    def _simplify_contact(self, group_name, target_count=0):
+        """Simplify a contact line to reduce node count while preserving shape."""
+        from geotools.contact_extraction import _adaptive_simplify, _simplify_to_target_count
+
+        # Find the contact
+        node_data = None
+        for scatter_id, data in self.contact_node_patches.items():
+            if data.get('group_name') == group_name:
+                node_data = data
+                break
+
+        if not node_data:
+            self.status_var.set(f"Contact '{group_name}' not found")
+            return
+
+        polyline = node_data.get('polyline')
+        if not polyline:
+            self.status_var.set(f"No polyline data for '{group_name}'")
+            return
+
+        vertices = list(polyline.vertices)
+        n_points = len(vertices) // 2
+
+        if n_points < 3:
+            self.status_var.set(f"Contact has only {n_points} points, cannot simplify further")
+            return
+
+        # Convert to list of (x, y) tuples for simplification
+        points = [(vertices[i*2], vertices[i*2+1]) for i in range(n_points)]
+
+        # Save for undo
+        self._push_undo('simplify_contact', {
+            'group_name': group_name,
+            'old_vertices': vertices.copy(),
+            'polyline': polyline
+        })
+
+        # Apply simplification
+        if target_count > 0 and target_count < n_points:
+            simplified = _simplify_to_target_count(points, target_count)
+        else:
+            # Use adaptive simplification with default tolerance
+            simplified = _adaptive_simplify(points, tolerance=2.0)
+
+        # Convert back to flat vertex list
+        new_vertices = []
+        for px, py in simplified:
+            new_vertices.extend([px, py])
+
+        polyline.vertices = new_vertices
+
+        old_count = n_points
+        new_count = len(simplified)
+        reduction = old_count - new_count
+        self.status_var.set(f"Simplified '{group_name}': {old_count} → {new_count} nodes ({reduction} removed)")
+
+        self._update_node_selection_display()
 
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""
