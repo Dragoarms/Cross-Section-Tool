@@ -5617,6 +5617,12 @@ class GeologicalCrossSectionGUI:
 
     def toggle_contact_editing(self):
         """Toggle contact node editing mode."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"=== TOGGLE CONTACT EDITING ===")
+        logger.info(f"  Before: contact_editing={self.contact_editing}")
+
         # Save current zoom/pan state for all axes
         saved_limits = {}
         if hasattr(self, 'fig_sections') and self.fig_sections:
@@ -5629,12 +5635,16 @@ class GeologicalCrossSectionGUI:
         self.selected_contact_nodes = []
         self.dragging_node = None
 
+        logger.info(f"  After: contact_editing={self.contact_editing}")
+        logger.info(f"  contact_node_patches count: {len(self.contact_node_patches)}")
+
         if self.contact_editing:
             self.status_var.set("Contact editing ON - click to select, drag to move, right-click to delete, Del key to delete selection")
         else:
             self.status_var.set("Contact editing OFF")
 
         self.update_section_display()
+        logger.info(f"  After update_section_display: contact_node_patches count: {len(self.contact_node_patches)}")
 
         # Restore zoom/pan state
         if saved_limits:
@@ -5648,11 +5658,27 @@ class GeologicalCrossSectionGUI:
 
     def on_section_button_press(self, event):
         """Handle mouse button press for contact node editing."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.debug(f"=== BUTTON PRESS EVENT ===")
+        logger.debug(f"  button={event.button}, inaxes={event.inaxes is not None}")
+        logger.debug(f"  xdata={event.xdata}, ydata={event.ydata}")
+        logger.debug(f"  contact_editing={self.contact_editing}")
+
         # Skip if toolbar is in zoom/pan mode
-        if hasattr(self, 'toolbar_sections') and self.toolbar_sections.mode:
+        toolbar_mode = getattr(self.toolbar_sections, 'mode', None) if hasattr(self, 'toolbar_sections') else None
+        logger.debug(f"  toolbar_mode={toolbar_mode}")
+        if toolbar_mode:
+            logger.debug("  -> Skipping: toolbar is in zoom/pan mode")
             return  # Let toolbar handle it
 
-        if not self.contact_editing or event.inaxes is None:
+        if not self.contact_editing:
+            logger.debug("  -> Skipping: contact_editing is False")
+            return
+
+        if event.inaxes is None:
+            logger.debug("  -> Skipping: click outside axes")
             return
 
         import time
@@ -5672,11 +5698,16 @@ class GeologicalCrossSectionGUI:
         self.last_click_pos = (event.xdata, event.ydata) if event.xdata else None
 
         if event.button == 1:  # Left click
+            logger.debug(f"  Left click at ({event.xdata:.1f}, {event.ydata:.1f})")
+            logger.debug(f"  contact_node_patches count: {len(self.contact_node_patches)}")
+
             # Find if we clicked on a contact node
             clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+            logger.debug(f"  clicked_node result: {clicked_node is not None}")
 
             if clicked_node:
                 group_name, node_idx, node_data = clicked_node
+                logger.debug(f"  Found node: group={group_name}, idx={node_idx}")
 
                 if is_double_click:
                     # Double-click: select all nodes in this contact
@@ -5807,22 +5838,42 @@ class GeologicalCrossSectionGUI:
             x, y: Data coordinates
             screen_tolerance_pixels: Tolerance in screen pixels (adaptive to zoom)
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         if x is None or y is None:
+            logger.debug(f"  _find_contact_node_at: x or y is None")
             return None
 
         # Calculate data-space tolerance based on current view
         # This makes clicking work at any zoom level
         tolerance = self._pixels_to_data_distance(screen_tolerance_pixels)
+        logger.debug(f"  _find_contact_node_at: click=({x:.1f}, {y:.1f}), tolerance={tolerance:.1f}")
+        logger.debug(f"  _find_contact_node_at: {len(self.contact_node_patches)} patch groups")
+
+        closest_dist = float('inf')
+        closest_info = None
 
         for scatter_id, node_data in self.contact_node_patches.items():
             x_coords = node_data.get('x_coords', [])
             z_coords = node_data.get('z_coords', [])
             group_name = node_data.get('group_name', '')
 
+            logger.debug(f"    Group '{group_name}': {len(x_coords)} nodes")
+
             for idx, (nx, nz) in enumerate(zip(x_coords, z_coords)):
                 dist = ((x - nx)**2 + (y - nz)**2)**0.5
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_info = (group_name, idx, nx, nz)
                 if dist < tolerance:
+                    logger.debug(f"    -> FOUND: node {idx} at ({nx:.1f}, {nz:.1f}), dist={dist:.1f}")
                     return (group_name, idx, node_data)
+
+        if closest_info:
+            logger.debug(f"  Closest node was '{closest_info[0]}' idx={closest_info[1]} at ({closest_info[2]:.1f}, {closest_info[3]:.1f}), dist={closest_dist:.1f} (tolerance={tolerance:.1f})")
+        else:
+            logger.debug(f"  No nodes found in any group")
 
         return None
 
@@ -6595,11 +6646,19 @@ class GeologicalCrossSectionGUI:
         - Ctrl+scroll: Zoom in/out at mouse position
         - Plain scroll: Navigate between sections
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         # Check for Ctrl modifier (state & 4 on Linux, state & 0x0004 on Windows)
         ctrl_held = (event.state & 0x4) != 0
 
+        logger.debug(f"=== MOUSEWHEEL EVENT ===")
+        logger.debug(f"  state={event.state}, ctrl_held={ctrl_held}")
+        logger.debug(f"  num={getattr(event, 'num', 'N/A')}, delta={getattr(event, 'delta', 'N/A')}")
+
         if ctrl_held:
             # Ctrl+scroll: Zoom at mouse position
+            logger.debug("  -> Calling _zoom_at_mouse")
             self._zoom_at_mouse(event)
         else:
             # Plain scroll: Navigate sections
@@ -6610,7 +6669,11 @@ class GeologicalCrossSectionGUI:
 
     def _zoom_at_mouse(self, event):
         """Zoom in/out centered on mouse position."""
+        import logging
+        logger = logging.getLogger(__name__)
+
         if not hasattr(self, 'fig_sections') or not self.fig_sections:
+            logger.debug("  _zoom_at_mouse: No fig_sections")
             return
 
         # Get mouse position in widget coordinates
