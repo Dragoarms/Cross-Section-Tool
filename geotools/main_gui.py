@@ -6149,8 +6149,9 @@ class GeologicalCrossSectionGUI:
 
             elif mode == "draw":
                 # DRAW mode:
-                # - Click first/last node to extend the line
-                # - Click any middle node to pick it up, then click to place it
+                # - Click anywhere to start/continue drawing
+                # - Click on a node to relocate it (middle nodes only)
+                # - Drawing connects to nearest contact endpoint when finished
 
                 # Check if we're currently relocating a node
                 if getattr(self, 'relocating_node', None):
@@ -6158,34 +6159,47 @@ class GeologicalCrossSectionGUI:
                     self._place_relocated_node(event.xdata, event.ydata)
                     return
 
-                # Check if we're extending a line
+                # Check if we're already drawing
                 if getattr(self, 'drawing_contact', None):
-                    # Already drawing/extending - add a point
+                    # Already drawing - add a point
                     self.drawing_points.append((event.xdata, event.ydata))
                     self._update_drawing_preview()
-                    self.status_var.set(f"Drawing: {len(self.drawing_points)} point(s) added. Click more or Finish/Cancel")
+                    self.status_var.set(f"Drawing: {len(self.drawing_points)} point(s). Click Finish when done, Esc to cancel")
                     return
 
-                # Not in any active drawing state - check what was clicked
+                # Not drawing yet - check what was clicked
                 clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
                 if clicked_node:
                     group_name, node_idx, node_data = clicked_node
                     x_coords = node_data.get('x_coords', [])
 
-                    # Check if this is the first or last node (extend mode)
+                    # Check if this is an endpoint (first or last node)
                     if node_idx == 0 or node_idx == len(x_coords) - 1:
+                        # Start extending from this endpoint
                         logger.debug(f"  DRAW mode: starting to extend {group_name} from node {node_idx}")
                         self.drawing_contact = group_name
                         self.drawing_from_start = (node_idx == 0)
                         self.drawing_node_data = node_data
                         self.drawing_points = []
-                        self.status_var.set(f"Extending: Click to add points, then Finish or Cancel")
+                        self.status_var.set(f"Extending {group_name}: Click to add points, Finish when done")
                     else:
                         # Middle node - pick it up for relocation
                         logger.debug(f"  DRAW mode: picking up node {node_idx} from {group_name} for relocation")
                         self._pickup_node_for_relocation(group_name, node_idx, node_data)
                 else:
-                    self.status_var.set("Click a node: first/last to extend, middle to relocate")
+                    # Clicked on empty space - find nearest contact endpoint and start drawing
+                    nearest = self._find_nearest_contact_endpoint(event.xdata, event.ydata)
+                    if nearest:
+                        group_name, is_start, node_data, dist = nearest
+                        # Start drawing from the first click point (we'll connect later)
+                        self.drawing_contact = group_name
+                        self.drawing_from_start = is_start
+                        self.drawing_node_data = node_data
+                        self.drawing_points = [(event.xdata, event.ydata)]  # First point is the click
+                        self._update_drawing_preview()
+                        self.status_var.set(f"Drawing from {group_name}: Click to add more points, Finish when done")
+                    else:
+                        self.status_var.set("No contacts to extend. Click on a contact endpoint to start drawing.")
 
     def on_section_button_release(self, event):
         """Handle mouse button release for contact node editing."""
@@ -6411,6 +6425,39 @@ class GeologicalCrossSectionGUI:
 
         return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
 
+    def _find_nearest_contact_endpoint(self, x, y):
+        """Find the nearest contact endpoint to the given coordinates.
+
+        Returns: (group_name, is_start, node_data, distance) or None
+        """
+        if x is None or y is None:
+            return None
+
+        best_dist = float('inf')
+        best_result = None
+
+        for scatter_id, node_data in self.contact_node_patches.items():
+            x_coords = node_data.get('x_coords', [])
+            z_coords = node_data.get('z_coords', [])
+            group_name = node_data.get('group_name', '')
+
+            if len(x_coords) < 2:
+                continue
+
+            # Check first endpoint (start)
+            dist_start = ((x - x_coords[0])**2 + (y - z_coords[0])**2)**0.5
+            if dist_start < best_dist:
+                best_dist = dist_start
+                best_result = (group_name, True, node_data, dist_start)
+
+            # Check last endpoint (end)
+            dist_end = ((x - x_coords[-1])**2 + (y - z_coords[-1])**2)**0.5
+            if dist_end < best_dist:
+                best_dist = dist_end
+                best_result = (group_name, False, node_data, dist_end)
+
+        return best_result
+
     def _select_all_contact_nodes(self, group_name, node_data):
         """Select all nodes in a contact (by group_name)."""
         x_coords = node_data.get('x_coords', [])
@@ -6421,29 +6468,62 @@ class GeologicalCrossSectionGUI:
         self.status_var.set(f"Selected all {len(x_coords)} nodes in {group_name}")
 
     def _update_node_selection_display(self):
-        """Update the visual display to show selected nodes."""
-        # Save zoom
-        saved_limits = {}
-        if hasattr(self, 'fig_sections') and self.fig_sections:
-            for ax in self.fig_sections.get_axes():
-                saved_limits[ax] = (ax.get_xlim(), ax.get_ylim())
-
-        # Redraw with selection highlighting
-        self.update_section_display()
-
-        # Restore zoom
-        if saved_limits:
-            for ax, (xlim, ylim) in saved_limits.items():
-                try:
-                    ax.set_xlim(xlim)
-                    ax.set_ylim(ylim)
-                except:
-                    pass
-            self.canvas_sections.draw_idle()
+        """Update the visual display to show selected nodes - lightweight version."""
+        # Use the lightweight refresh instead of full redraw
+        self._refresh_contact_display()
 
         n_selected = len(self.selected_contact_nodes)
         if n_selected > 0:
             self.status_var.set(f"{n_selected} node(s) selected - drag to move, Del to delete")
+
+    def _refresh_contact_display(self):
+        """Lightweight refresh of contact display without full redraw."""
+        if not hasattr(self, 'fig_sections') or not self.fig_sections:
+            return
+
+        # Update each contact's line and scatter data directly
+        for line_artist, contact_data in getattr(self, 'contact_patches', {}).items():
+            polyline = contact_data.get('polyline')
+            if not polyline:
+                continue
+
+            try:
+                vertices = polyline.vertices
+                n_points = len(vertices) // 2
+                x = [vertices[i * 2] for i in range(n_points)]
+                z = [vertices[i * 2 + 1] for i in range(n_points)]
+
+                # Update line data
+                line_artist.set_xdata(x)
+                line_artist.set_ydata(z)
+            except Exception as e:
+                logger.debug(f"Error updating line: {e}")
+
+        # Update scatter plot data
+        for scatter_id, node_data in getattr(self, 'contact_node_patches', {}).items():
+            polyline = node_data.get('polyline')
+            scatter = node_data.get('scatter')
+            if not polyline or not scatter:
+                continue
+
+            try:
+                vertices = polyline.vertices
+                n_points = len(vertices) // 2
+                x = [vertices[i * 2] for i in range(n_points)]
+                z = [vertices[i * 2 + 1] for i in range(n_points)]
+
+                # Update scatter offsets
+                import numpy as np
+                scatter.set_offsets(np.column_stack([x, z]))
+
+                # Update stored coords
+                node_data['x_coords'] = x
+                node_data['z_coords'] = z
+            except Exception as e:
+                logger.debug(f"Error updating scatter: {e}")
+
+        # Just redraw the canvas without resetting limits
+        self.canvas_sections.draw_idle()
 
     def _move_selected_nodes(self, dx, dy):
         """Move all selected nodes by the given delta."""
