@@ -651,11 +651,16 @@ class FeatureExtractor:
         return vertices if vertices else None
 
     def _get_color(self, annot) -> Optional[tuple]:
-        """Get color from annotation."""
+        """Get color from annotation, preferring fill color for polygons."""
         color = None
 
         if hasattr(annot, "colors") and annot.colors:
-            color = annot.colors.get("stroke") or annot.colors.get("fill")
+            # Prefer fill color over stroke - fill distinguishes geological units
+            color = annot.colors.get("fill") or annot.colors.get("stroke")
+
+        # Also check for fill_color attribute
+        if not color and hasattr(annot, "fill_color") and annot.fill_color:
+            color = annot.fill_color
 
         if not color and hasattr(annot, "stroke_color"):
             color = annot.stroke_color

@@ -629,8 +629,13 @@ class GeologicalCrossSectionGUI:
         self.canvas_sections.mpl_connect("button_press_event", self.on_section_button_press)
         self.canvas_sections.mpl_connect("button_release_event", self.on_section_button_release)
         self.canvas_sections.mpl_connect("key_press_event", self.on_section_key_press)
+        self.canvas_sections.mpl_connect("scroll_event", self.on_mpl_scroll)
         # Enable keyboard focus for canvas
         canvas_widget.bind("<Button-1>", lambda e: canvas_widget.focus_set())
+        # Bind Ctrl+mousewheel for zoom
+        canvas_widget.bind("<Control-MouseWheel>", self.on_ctrl_mousewheel)
+        canvas_widget.bind("<Control-Button-4>", self.on_ctrl_mousewheel)  # Linux
+        canvas_widget.bind("<Control-Button-5>", self.on_ctrl_mousewheel)  # Linux
         
         # Tooltip annotation (hidden initially)
         self.tooltip_annotation = None
@@ -5643,6 +5648,10 @@ class GeologicalCrossSectionGUI:
 
     def on_section_button_press(self, event):
         """Handle mouse button press for contact node editing."""
+        # Skip if toolbar is in zoom/pan mode
+        if hasattr(self, 'toolbar_sections') and self.toolbar_sections.mode:
+            return  # Let toolbar handle it
+
         if not self.contact_editing or event.inaxes is None:
             return
 
@@ -5717,7 +5726,39 @@ class GeologicalCrossSectionGUI:
         self.drag_start_pos = None
 
     def on_section_key_press(self, event):
-        """Handle key press events for contact node editing."""
+        """Handle key press events for section viewer.
+
+        Key bindings:
+        - Delete/Backspace: Delete selected contact nodes (in edit mode)
+        - Home: Reset zoom to fit all data
+        - Escape: Clear selection / exit edit mode
+        - +/=: Zoom in
+        - -: Zoom out
+        """
+        # Handle Home key - reset zoom (always available)
+        if event.key == 'home':
+            self._reset_view_to_fit()
+            return
+
+        # Handle +/- zoom keys
+        if event.key in ('+', '='):
+            self._zoom_view(0.8)  # Zoom in
+            return
+        if event.key == '-':
+            self._zoom_view(1.25)  # Zoom out
+            return
+
+        # Handle Escape - clear selection or exit edit mode
+        if event.key == 'escape':
+            if self.contact_editing:
+                if self.selected_contact_nodes:
+                    self.selected_contact_nodes = []
+                    self._update_node_selection_display()
+                else:
+                    self.toggle_contact_editing()
+            return
+
+        # Contact editing specific keys
         if not self.contact_editing:
             return
 
@@ -5725,10 +5766,53 @@ class GeologicalCrossSectionGUI:
             if self.selected_contact_nodes:
                 self._delete_selected_nodes()
 
-    def _find_contact_node_at(self, x, y, tolerance=8):
-        """Find a contact node near the given coordinates."""
+    def _reset_view_to_fit(self):
+        """Reset view to fit all data."""
+        if not hasattr(self, 'fig_sections') or not self.fig_sections:
+            return
+
+        for ax in self.fig_sections.get_axes():
+            ax.autoscale()
+            ax.relim()
+            ax.autoscale_view()
+
+        self.canvas_sections.draw_idle()
+
+    def _zoom_view(self, scale_factor):
+        """Zoom the view by scale_factor centered on the current view."""
+        if not hasattr(self, 'fig_sections') or not self.fig_sections:
+            return
+
+        for ax in self.fig_sections.get_axes():
+            xlim = ax.get_xlim()
+            ylim = ax.get_ylim()
+
+            # Center of current view
+            x_center = (xlim[0] + xlim[1]) / 2
+            y_center = (ylim[0] + ylim[1]) / 2
+
+            # New range
+            x_range = (xlim[1] - xlim[0]) * scale_factor / 2
+            y_range = (ylim[1] - ylim[0]) * scale_factor / 2
+
+            ax.set_xlim(x_center - x_range, x_center + x_range)
+            ax.set_ylim(y_center - y_range, y_center + y_range)
+
+        self.canvas_sections.draw_idle()
+
+    def _find_contact_node_at(self, x, y, screen_tolerance_pixels=15):
+        """Find a contact node near the given coordinates.
+
+        Args:
+            x, y: Data coordinates
+            screen_tolerance_pixels: Tolerance in screen pixels (adaptive to zoom)
+        """
         if x is None or y is None:
             return None
+
+        # Calculate data-space tolerance based on current view
+        # This makes clicking work at any zoom level
+        tolerance = self._pixels_to_data_distance(screen_tolerance_pixels)
 
         for scatter_id, node_data in self.contact_node_patches.items():
             x_coords = node_data.get('x_coords', [])
@@ -5742,10 +5826,41 @@ class GeologicalCrossSectionGUI:
 
         return None
 
-    def _find_contact_line_at(self, x, y, tolerance=5):
+    def _pixels_to_data_distance(self, pixels):
+        """Convert a pixel distance to data coordinate distance based on current view."""
+        if not hasattr(self, 'fig_sections') or not self.fig_sections:
+            return pixels  # Fallback
+
+        # Use the first axis for calculation
+        axes = self.fig_sections.get_axes()
+        if not axes:
+            return pixels
+
+        ax = axes[0]
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        # Get axis bbox in display coords
+        bbox = ax.get_window_extent()
+        width_pixels = bbox.width
+        height_pixels = bbox.height
+
+        if width_pixels > 0 and height_pixels > 0:
+            # Calculate scale: data units per pixel
+            x_scale = (xlim[1] - xlim[0]) / width_pixels
+            y_scale = (ylim[1] - ylim[0]) / height_pixels
+            # Use the average scale
+            return pixels * (x_scale + y_scale) / 2
+
+        return pixels
+
+    def _find_contact_line_at(self, x, y, screen_tolerance_pixels=10):
         """Find a contact line segment near the given coordinates."""
         if x is None or y is None:
             return None
+
+        # Calculate data-space tolerance based on current view
+        tolerance = self._pixels_to_data_distance(screen_tolerance_pixels)
 
         for scatter_id, node_data in self.contact_node_patches.items():
             x_coords = node_data.get('x_coords', [])
@@ -6475,11 +6590,121 @@ class GeologicalCrossSectionGUI:
         self.update_section_display()
 
     def on_mousewheel(self, event):
-        """Handle mouse wheel scrolling."""
-        if event.num == 4 or event.delta > 0:
-            self.prev_section()
-        elif event.num == 5 or event.delta < 0:
-            self.next_section()
+        """Handle mouse wheel scrolling.
+
+        - Ctrl+scroll: Zoom in/out at mouse position
+        - Plain scroll: Navigate between sections
+        """
+        # Check for Ctrl modifier (state & 4 on Linux, state & 0x0004 on Windows)
+        ctrl_held = (event.state & 0x4) != 0
+
+        if ctrl_held:
+            # Ctrl+scroll: Zoom at mouse position
+            self._zoom_at_mouse(event)
+        else:
+            # Plain scroll: Navigate sections
+            if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+                self.prev_section()
+            elif event.num == 5 or (hasattr(event, 'delta') and event.delta < 0):
+                self.next_section()
+
+    def _zoom_at_mouse(self, event):
+        """Zoom in/out centered on mouse position."""
+        if not hasattr(self, 'fig_sections') or not self.fig_sections:
+            return
+
+        # Get mouse position in widget coordinates
+        widget = event.widget
+        x_widget = event.x
+        y_widget = event.y
+
+        # Determine zoom direction
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            scale_factor = 0.8  # Zoom in
+        else:
+            scale_factor = 1.25  # Zoom out
+
+        # Get the canvas and find which axis the mouse is over
+        for ax in self.fig_sections.get_axes():
+            # Get axis bounding box in display coordinates
+            bbox = ax.get_window_extent().transformed(self.fig_sections.dpi_scale_trans.inverted())
+
+            # Convert widget coords to figure coords
+            fig_width = self.fig_sections.get_figwidth()
+            fig_height = self.fig_sections.get_figheight()
+
+            # Get canvas dimensions
+            canvas_width = self.canvas_sections.get_tk_widget().winfo_width()
+            canvas_height = self.canvas_sections.get_tk_widget().winfo_height()
+
+            # Convert widget coordinates to figure coordinates
+            fig_x = x_widget / canvas_width * fig_width
+            fig_y = (canvas_height - y_widget) / canvas_height * fig_height  # Flip y
+
+            # Check if mouse is in this axis
+            if bbox.x0 <= fig_x <= bbox.x1 and bbox.y0 <= fig_y <= bbox.y1:
+                # Get current limits
+                xlim = ax.get_xlim()
+                ylim = ax.get_ylim()
+
+                # Get mouse position in data coordinates
+                inv = ax.transData.inverted()
+                # Convert display coords (pixels) to data coords
+                display_x = x_widget
+                display_y = canvas_height - y_widget  # Flip for matplotlib
+                data_x, data_y = inv.transform((display_x, display_y))
+
+                # Calculate new limits, centered on mouse position
+                x_left = data_x - (data_x - xlim[0]) * scale_factor
+                x_right = data_x + (xlim[1] - data_x) * scale_factor
+                y_bottom = data_y - (data_y - ylim[0]) * scale_factor
+                y_top = data_y + (ylim[1] - data_y) * scale_factor
+
+                ax.set_xlim(x_left, x_right)
+                ax.set_ylim(y_bottom, y_top)
+
+                self.canvas_sections.draw_idle()
+                break
+
+    def on_ctrl_mousewheel(self, event):
+        """Handle Ctrl+mousewheel for zooming (tk event)."""
+        self._zoom_at_mouse(event)
+
+    def on_mpl_scroll(self, event):
+        """Handle matplotlib scroll event for zooming."""
+        if event.inaxes is None:
+            return
+
+        # Check if Ctrl is held (matplotlib key)
+        if event.key != 'control':
+            return
+
+        # Determine zoom direction
+        if event.button == 'up':
+            scale_factor = 0.8  # Zoom in
+        elif event.button == 'down':
+            scale_factor = 1.25  # Zoom out
+        else:
+            return
+
+        ax = event.inaxes
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+
+        # Mouse position in data coords
+        xdata = event.xdata
+        ydata = event.ydata
+
+        # Calculate new limits, centered on mouse position
+        x_left = xdata - (xdata - xlim[0]) * scale_factor
+        x_right = xdata + (xlim[1] - xdata) * scale_factor
+        y_bottom = ydata - (ydata - ylim[0]) * scale_factor
+        y_top = ydata + (ylim[1] - ydata) * scale_factor
+
+        ax.set_xlim(x_left, x_right)
+        ax.set_ylim(y_bottom, y_top)
+
+        self.canvas_sections.draw_idle()
 
     def prev_section(self):
         """Move to previous section."""
