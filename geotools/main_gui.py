@@ -192,6 +192,8 @@ class GeologicalCrossSectionGUI:
         self.drawing_node_data = None  # Node data for the contact being extended
         self.drawing_preview_line = None  # Preview line artist
         self.drawing_preview_points = None  # Preview points artist
+        self.relocating_node = None  # Dict with info about node being relocated
+        self.relocation_marker = None  # Visual marker for node being relocated
 
         # Undo/Redo history for contact editing
         self.contact_undo_stack = []  # List of (action, data) tuples
@@ -6008,7 +6010,7 @@ class GeologicalCrossSectionGUI:
         modes = [
             ("Delete", "delete", "Click node to delete it"),
             ("Add", "add", "Click on line to add node"),
-            ("Draw", "draw", "Click last node then draw to extend"),
+            ("Draw", "draw", "Extend from ends or relocate middle nodes"),
         ]
         for label, mode, tooltip in modes:
             btn = ttk.Button(mode_frame, text=label, width=8,
@@ -6058,7 +6060,7 @@ class GeologicalCrossSectionGUI:
         mode_messages = {
             "delete": "DELETE mode: Click a node to remove it",
             "add": "ADD mode: Click on a contact line to add a new node",
-            "draw": "DRAW mode: Click the last node of a contact, then click to add points. Finish or Cancel when done.",
+            "draw": "DRAW mode: Click first/last node to extend, or middle node to relocate",
         }
         self.status_var.set(mode_messages.get(mode, ""))
 
@@ -6145,30 +6147,44 @@ class GeologicalCrossSectionGUI:
                     self.status_var.set("Click on a contact line to add a node")
 
             elif mode == "draw":
-                # DRAW mode: click last node to start, then click to add points
-                if not getattr(self, 'drawing_contact', None):
-                    # Not drawing yet - check if clicked on last node of a contact
-                    clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
-                    if clicked_node:
-                        group_name, node_idx, node_data = clicked_node
-                        x_coords = node_data.get('x_coords', [])
-                        # Check if this is the first or last node
-                        if node_idx == 0 or node_idx == len(x_coords) - 1:
-                            logger.debug(f"  DRAW mode: starting to extend {group_name} from node {node_idx}")
-                            self.drawing_contact = group_name
-                            self.drawing_from_start = (node_idx == 0)  # True if extending from start
-                            self.drawing_node_data = node_data
-                            self.drawing_points = []  # New points to add
-                            self.status_var.set(f"Drawing: Click to add points, then Finish or Cancel")
-                        else:
-                            self.status_var.set("Click on the FIRST or LAST node of a contact to extend it")
-                    else:
-                        self.status_var.set("Click on the first or last node of a contact to start drawing")
-                else:
-                    # Already drawing - add a point
+                # DRAW mode:
+                # - Click first/last node to extend the line
+                # - Click any middle node to pick it up, then click to place it
+
+                # Check if we're currently relocating a node
+                if getattr(self, 'relocating_node', None):
+                    # Place the node at the clicked position
+                    self._place_relocated_node(event.xdata, event.ydata)
+                    return
+
+                # Check if we're extending a line
+                if getattr(self, 'drawing_contact', None):
+                    # Already drawing/extending - add a point
                     self.drawing_points.append((event.xdata, event.ydata))
                     self._update_drawing_preview()
                     self.status_var.set(f"Drawing: {len(self.drawing_points)} point(s) added. Click more or Finish/Cancel")
+                    return
+
+                # Not in any active drawing state - check what was clicked
+                clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+                if clicked_node:
+                    group_name, node_idx, node_data = clicked_node
+                    x_coords = node_data.get('x_coords', [])
+
+                    # Check if this is the first or last node (extend mode)
+                    if node_idx == 0 or node_idx == len(x_coords) - 1:
+                        logger.debug(f"  DRAW mode: starting to extend {group_name} from node {node_idx}")
+                        self.drawing_contact = group_name
+                        self.drawing_from_start = (node_idx == 0)
+                        self.drawing_node_data = node_data
+                        self.drawing_points = []
+                        self.status_var.set(f"Extending: Click to add points, then Finish or Cancel")
+                    else:
+                        # Middle node - pick it up for relocation
+                        logger.debug(f"  DRAW mode: picking up node {node_idx} from {group_name} for relocation")
+                        self._pickup_node_for_relocation(group_name, node_idx, node_data)
+                else:
+                    self.status_var.set("Click a node: first/last to extend, middle to relocate")
 
     def on_section_button_release(self, event):
         """Handle mouse button release for contact node editing."""
@@ -6685,6 +6701,19 @@ class GeologicalCrossSectionGUI:
             polyline.vertices = vertices
             self.status_var.set(f"Undo: removed {n_points_added} drawn points")
 
+        elif action_type == 'relocate_node':
+            # Undo relocate = move node back to original position
+            node_idx = data['node_idx']
+            old_x = data['old_x']
+            old_y = data['old_y']
+            vertices = list(polyline.vertices)
+            vert_idx = node_idx * 2
+            if vert_idx + 1 < len(vertices):
+                vertices[vert_idx] = old_x
+                vertices[vert_idx + 1] = old_y
+                polyline.vertices = vertices
+            self.status_var.set(f"Undo: node moved back to original position")
+
         # Push to redo stack
         if not hasattr(self, 'contact_redo_stack'):
             self.contact_redo_stack = []
@@ -6737,6 +6766,19 @@ class GeologicalCrossSectionGUI:
                 vertices = vertices + flat_points
             polyline.vertices = vertices
             self.status_var.set(f"Redo: re-added {len(points)} drawn points")
+
+        elif action_type == 'relocate_node':
+            # Redo relocate = move node to new position again
+            node_idx = data['node_idx']
+            new_x = data['new_x']
+            new_y = data['new_y']
+            vertices = list(polyline.vertices)
+            vert_idx = node_idx * 2
+            if vert_idx + 1 < len(vertices):
+                vertices[vert_idx] = new_x
+                vertices[vert_idx + 1] = new_y
+                polyline.vertices = vertices
+            self.status_var.set(f"Redo: node relocated")
 
         # Push back to undo stack
         self.contact_undo_stack.append((action_type, data))
@@ -6863,9 +6905,13 @@ class GeologicalCrossSectionGUI:
         self._update_node_selection_display()
 
     def _cancel_drawing(self):
-        """Cancel the current drawing operation."""
+        """Cancel the current drawing or relocation operation."""
         if getattr(self, 'drawing_contact', None):
             self.status_var.set("Drawing cancelled")
+        elif getattr(self, 'relocating_node', None):
+            # Restore the node to its original position
+            self._restore_relocated_node()
+            self.status_var.set("Relocation cancelled")
         self._clear_drawing_state()
         self._update_node_selection_display()
 
@@ -6875,6 +6921,7 @@ class GeologicalCrossSectionGUI:
         self.drawing_points = []
         self.drawing_node_data = None
         self.drawing_from_start = False
+        self.relocating_node = None
 
         # Remove preview graphics
         if hasattr(self, 'drawing_preview_line') and self.drawing_preview_line:
@@ -6890,6 +6937,129 @@ class GeologicalCrossSectionGUI:
             except:
                 pass
             self.drawing_preview_points = None
+
+        # Remove relocation marker
+        if hasattr(self, 'relocation_marker') and self.relocation_marker:
+            try:
+                self.relocation_marker.remove()
+            except:
+                pass
+            self.relocation_marker = None
+
+    def _pickup_node_for_relocation(self, group_name, node_idx, node_data):
+        """Pick up a node for relocation (visually remove it, waiting for placement click)."""
+        polyline = node_data.get('polyline')
+        if not polyline:
+            return
+
+        vertices = list(polyline.vertices)
+        n_points = len(vertices) // 2
+
+        # Need at least 3 points to relocate (can't relocate if only 2 points)
+        if n_points < 3:
+            self.status_var.set("Cannot relocate - contact needs at least 3 points")
+            return
+
+        vert_idx = node_idx * 2
+        if vert_idx + 1 >= len(vertices):
+            return
+
+        # Store the original position and info for undo/restore
+        original_x = vertices[vert_idx]
+        original_y = vertices[vert_idx + 1]
+
+        self.relocating_node = {
+            'group_name': group_name,
+            'node_idx': node_idx,
+            'original_x': original_x,
+            'original_y': original_y,
+            'polyline': polyline,
+            'node_data': node_data
+        }
+
+        # Visually "remove" the node by moving line segments to skip it
+        # We'll redraw with a visual indicator showing the gap
+        self._update_relocation_preview()
+
+        self.status_var.set(f"Node picked up - click to place at new position (Esc to cancel)")
+
+    def _update_relocation_preview(self):
+        """Update visual preview showing the node being relocated."""
+        if not self.relocating_node:
+            return
+
+        # Remove old marker
+        if hasattr(self, 'relocation_marker') and self.relocation_marker:
+            try:
+                self.relocation_marker.remove()
+            except:
+                pass
+            self.relocation_marker = None
+
+        # Find the correct axes
+        axes = self.fig_sections.get_axes() if hasattr(self, 'fig_sections') and self.fig_sections else []
+        if not axes:
+            return
+
+        ax = axes[0]
+
+        # Draw a marker at the original position with a special style
+        orig_x = self.relocating_node['original_x']
+        orig_y = self.relocating_node['original_y']
+
+        # Draw an X marker at the original position
+        self.relocation_marker = ax.scatter(
+            [orig_x], [orig_y],
+            c='red', s=100, marker='x', linewidths=3, zorder=102
+        )
+
+        self.canvas_sections.draw_idle()
+
+    def _place_relocated_node(self, new_x, new_y):
+        """Place the relocated node at the new position."""
+        if not self.relocating_node:
+            return
+
+        polyline = self.relocating_node['polyline']
+        node_idx = self.relocating_node['node_idx']
+        original_x = self.relocating_node['original_x']
+        original_y = self.relocating_node['original_y']
+        group_name = self.relocating_node['group_name']
+
+        vertices = list(polyline.vertices)
+        vert_idx = node_idx * 2
+
+        if vert_idx + 1 >= len(vertices):
+            self._clear_drawing_state()
+            return
+
+        # Save state for undo
+        self._push_undo('relocate_node', {
+            'group_name': group_name,
+            'node_idx': node_idx,
+            'old_x': original_x,
+            'old_y': original_y,
+            'new_x': new_x,
+            'new_y': new_y,
+            'polyline': polyline
+        })
+
+        # Update the node position
+        vertices[vert_idx] = new_x
+        vertices[vert_idx + 1] = new_y
+        polyline.vertices = vertices
+
+        self.status_var.set(f"Node relocated in {group_name}")
+
+        # Clear relocation state
+        self._clear_drawing_state()
+        self._update_node_selection_display()
+
+    def _restore_relocated_node(self):
+        """Restore a node being relocated to its original position (on cancel)."""
+        # Node is still in place, we just clear the visual indicator
+        # No actual restoration needed since we didn't modify the polyline yet
+        pass
 
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""
