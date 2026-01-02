@@ -583,16 +583,38 @@ class FeatureExtractor:
             Tuple of (formation_name, is_from_subject)
             is_from_subject is True if the formation came from the PDF subject field
         """
+        # Default/generic names that should be ignored and replaced with color-based identification
+        DEFAULT_SUBJECT_NAMES = {
+            'polygon', 'polyline', 'line', 'shape', 'annotation',
+            'square', 'rectangle', 'circle', 'oval', 'ellipse',
+            'pencil', 'freehand', 'ink', 'highlight', 'strikeout',
+            'underline', 'squiggly', 'stamp', 'caret', 'fileattachment',
+            'sound', 'movie', 'widget', 'screen', 'printermark',
+            'trapnet', 'watermark', '3d', 'redact', 'projection',
+            'unknown', 'none', '', 'default'
+        }
+
         if hasattr(annot, 'info'):
             info = annot.info
             subject = info.get('subject', '') or info.get('content', '')
             if subject and subject.strip():
+                subject_lower = subject.strip().lower()
+
                 # Check for saved assignment (from write_assignments_to_pdf)
                 if subject.startswith('Assigned:'):
                     return subject[9:].strip().upper(), True  # Return saved assignment
+
                 # Don't use 'Fault' as formation name
-                if 'fault' not in subject.lower():
-                    return subject.strip().upper(), True
+                if 'fault' in subject_lower:
+                    return self._identify_formation(color), False
+
+                # Skip default/generic annotation type names
+                if subject_lower in DEFAULT_SUBJECT_NAMES:
+                    # Use color-based identification instead
+                    return self._identify_formation(color), False
+
+                # Valid subject - use it
+                return subject.strip().upper(), True
 
         # Infer from color (not from subject)
         return self._identify_formation(color), False
