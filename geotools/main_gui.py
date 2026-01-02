@@ -184,6 +184,23 @@ class GeologicalCrossSectionGUI:
         self.last_click_time = 0  # For double-click detection
         self.last_click_pos = None  # For double-click detection
 
+        # Contact editing modes
+        self.contact_edit_mode = "select"  # "select", "delete", "add", "draw"
+        self.drawing_contact = None  # Group name when drawing/extending a contact
+        self.drawing_points = []  # Points being drawn in draw mode
+        self.drawing_from_start = False  # True if extending from start of line
+        self.drawing_node_data = None  # Node data for the contact being extended
+        self.drawing_preview_line = None  # Preview line artist
+        self.drawing_preview_points = None  # Preview points artist
+
+        # Undo/Redo history for contact editing
+        self.contact_undo_stack = []  # List of (action, data) tuples
+        self.contact_redo_stack = []
+        self.max_undo_history = 50
+
+        # Flag to prevent hover selection during scroll
+        self.scrolling_sections = False
+
         # Classification mode state
         self.classification_mode = "none"  # "none", "polygon", "fault", "contact"
         self.current_unit_assignment = None  # Unit name to assign when clicking
@@ -5945,13 +5962,17 @@ class GeologicalCrossSectionGUI:
         # Clear selection state when toggling
         self.selected_contact_nodes = []
         self.dragging_node = None
+        self.contact_edit_mode = "delete"  # Default to delete mode
+        self.drawing_contact = None
+        self.drawing_points = []
 
         logger.info(f"  After: contact_editing={self.contact_editing}")
         logger.info(f"  contact_node_patches count: {len(self.contact_node_patches)}")
 
         if self.contact_editing:
-            self.status_var.set("Contact editing ON - click to select, drag to move, right-click to delete, Del key to delete selection")
+            self._show_contact_edit_toolbar()
         else:
+            self._hide_contact_edit_toolbar()
             self.status_var.set("Contact editing OFF")
 
         self.update_section_display()
@@ -5966,6 +5987,95 @@ class GeologicalCrossSectionGUI:
                 except:
                     pass
             self.canvas_sections.draw_idle()
+
+    def _show_contact_edit_toolbar(self):
+        """Show the contact editing toolbar with mode buttons."""
+        # Check if toolbar already exists
+        if hasattr(self, 'contact_edit_toolbar') and self.contact_edit_toolbar:
+            self.contact_edit_toolbar.pack(fill=tk.X, padx=5, pady=2, before=self.canvas_sections.get_tk_widget())
+            self._update_edit_mode_buttons()
+            return
+
+        # Create toolbar frame
+        self.contact_edit_toolbar = ttk.Frame(self.canvas_sections.get_tk_widget().master)
+        self.contact_edit_toolbar.pack(fill=tk.X, padx=5, pady=2, before=self.canvas_sections.get_tk_widget())
+
+        # Mode buttons frame
+        mode_frame = ttk.LabelFrame(self.contact_edit_toolbar, text="Edit Mode", padding=2)
+        mode_frame.pack(side=tk.LEFT, padx=5)
+
+        self.edit_mode_buttons = {}
+        modes = [
+            ("Delete", "delete", "Click node to delete it"),
+            ("Add", "add", "Click on line to add node"),
+            ("Draw", "draw", "Click last node then draw to extend"),
+        ]
+        for label, mode, tooltip in modes:
+            btn = ttk.Button(mode_frame, text=label, width=8,
+                           command=lambda m=mode: self._set_contact_edit_mode(m))
+            btn.pack(side=tk.LEFT, padx=2)
+            self.edit_mode_buttons[mode] = btn
+
+        # Undo/Redo frame
+        undo_frame = ttk.LabelFrame(self.contact_edit_toolbar, text="History", padding=2)
+        undo_frame.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(undo_frame, text="Undo", command=self._undo_contact_edit, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Button(undo_frame, text="Redo", command=self._redo_contact_edit, width=6).pack(side=tk.LEFT, padx=2)
+
+        # Actions frame
+        action_frame = ttk.LabelFrame(self.contact_edit_toolbar, text="Actions", padding=2)
+        action_frame.pack(side=tk.LEFT, padx=5)
+
+        ttk.Button(action_frame, text="Finish Draw", command=self._finish_drawing, width=10).pack(side=tk.LEFT, padx=2)
+        ttk.Button(action_frame, text="Cancel", command=self._cancel_drawing, width=7).pack(side=tk.LEFT, padx=2)
+
+        # Keybinds info
+        info_frame = ttk.LabelFrame(self.contact_edit_toolbar, text="Keybinds", padding=2)
+        info_frame.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        keybind_text = "Del: Delete node | Ctrl+Z: Undo | Ctrl+Y: Redo | Esc: Cancel/Exit | Home: Reset view"
+        ttk.Label(info_frame, text=keybind_text, font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
+
+        # Close button
+        ttk.Button(self.contact_edit_toolbar, text="✕ Close", command=self.toggle_contact_editing,
+                  width=8).pack(side=tk.RIGHT, padx=5)
+
+        self._update_edit_mode_buttons()
+        self.status_var.set("DELETE mode: Click a node to remove it")
+
+    def _hide_contact_edit_toolbar(self):
+        """Hide the contact editing toolbar."""
+        if hasattr(self, 'contact_edit_toolbar') and self.contact_edit_toolbar:
+            self.contact_edit_toolbar.pack_forget()
+
+    def _set_contact_edit_mode(self, mode):
+        """Set the contact editing mode."""
+        self.contact_edit_mode = mode
+        self._update_edit_mode_buttons()
+
+        # Update status message
+        mode_messages = {
+            "delete": "DELETE mode: Click a node to remove it",
+            "add": "ADD mode: Click on a contact line to add a new node",
+            "draw": "DRAW mode: Click the last node of a contact, then click to add points. Finish or Cancel when done.",
+        }
+        self.status_var.set(mode_messages.get(mode, ""))
+
+        # Cancel any ongoing drawing when switching modes
+        if mode != "draw":
+            self._cancel_drawing()
+
+    def _update_edit_mode_buttons(self):
+        """Update the visual state of edit mode buttons."""
+        if not hasattr(self, 'edit_mode_buttons'):
+            return
+
+        for mode, btn in self.edit_mode_buttons.items():
+            if mode == self.contact_edit_mode:
+                btn.state(['pressed'])
+            else:
+                btn.state(['!pressed'])
 
     def on_section_button_press(self, event):
         """Handle mouse button press for contact node editing."""
@@ -6011,45 +6121,54 @@ class GeologicalCrossSectionGUI:
         if event.button == 1:  # Left click
             logger.debug(f"  Left click at ({event.xdata:.1f}, {event.ydata:.1f})")
             logger.debug(f"  contact_node_patches count: {len(self.contact_node_patches)}")
+            logger.debug(f"  contact_edit_mode: {self.contact_edit_mode}")
 
-            # Find if we clicked on a contact node
-            clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
-            logger.debug(f"  clicked_node result: {clicked_node is not None}")
+            # Handle based on current edit mode
+            mode = getattr(self, 'contact_edit_mode', 'delete')
 
-            if clicked_node:
-                group_name, node_idx, node_data = clicked_node
-                logger.debug(f"  Found node: group={group_name}, idx={node_idx}")
+            if mode == "delete":
+                # DELETE mode: click a node to delete it
+                clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+                if clicked_node:
+                    group_name, node_idx, node_data = clicked_node
+                    logger.debug(f"  DELETE mode: removing node {node_idx} from {group_name}")
+                    self._delete_single_node(group_name, node_idx, node_data)
 
-                if is_double_click:
-                    # Double-click: select all nodes in this contact
-                    self._select_all_contact_nodes(group_name, node_data)
-                else:
-                    # Single click: toggle selection or start drag
-                    node_key = (group_name, node_idx)
-                    if node_key in self.selected_contact_nodes:
-                        # Already selected - start dragging
-                        self.dragging_node = node_key
-                        self.drag_start_pos = (event.xdata, event.ydata)
-                    else:
-                        # Not selected - select it (add to selection if shift held)
-                        if not event.key == 'shift':
-                            self.selected_contact_nodes = []
-                        self.selected_contact_nodes.append(node_key)
-                        # Also prepare for potential drag
-                        self.dragging_node = node_key
-                        self.drag_start_pos = (event.xdata, event.ydata)
-
-                    self._update_node_selection_display()
-            else:
-                # Clicked on empty space - check if clicked on contact line to break it
+            elif mode == "add":
+                # ADD mode: click on a line to add a node there
                 clicked_line = self._find_contact_line_at(event.xdata, event.ydata)
                 if clicked_line:
                     group_name, segment_idx, node_data = clicked_line
-                    self._break_contact_at_segment(group_name, segment_idx, node_data)
+                    logger.debug(f"  ADD mode: inserting node at segment {segment_idx} of {group_name}")
+                    self._insert_node_at_segment(group_name, segment_idx, node_data, event.xdata, event.ydata)
                 else:
-                    # Clear selection
-                    self.selected_contact_nodes = []
-                    self._update_node_selection_display()
+                    self.status_var.set("Click on a contact line to add a node")
+
+            elif mode == "draw":
+                # DRAW mode: click last node to start, then click to add points
+                if not getattr(self, 'drawing_contact', None):
+                    # Not drawing yet - check if clicked on last node of a contact
+                    clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+                    if clicked_node:
+                        group_name, node_idx, node_data = clicked_node
+                        x_coords = node_data.get('x_coords', [])
+                        # Check if this is the first or last node
+                        if node_idx == 0 or node_idx == len(x_coords) - 1:
+                            logger.debug(f"  DRAW mode: starting to extend {group_name} from node {node_idx}")
+                            self.drawing_contact = group_name
+                            self.drawing_from_start = (node_idx == 0)  # True if extending from start
+                            self.drawing_node_data = node_data
+                            self.drawing_points = []  # New points to add
+                            self.status_var.set(f"Drawing: Click to add points, then Finish or Cancel")
+                        else:
+                            self.status_var.set("Click on the FIRST or LAST node of a contact to extend it")
+                    else:
+                        self.status_var.set("Click on the first or last node of a contact to start drawing")
+                else:
+                    # Already drawing - add a point
+                    self.drawing_points.append((event.xdata, event.ydata))
+                    self._update_drawing_preview()
+                    self.status_var.set(f"Drawing: {len(self.drawing_points)} point(s) added. Click more or Finish/Cancel")
 
     def on_section_button_release(self, event):
         """Handle mouse button release for contact node editing."""
@@ -6073,9 +6192,11 @@ class GeologicalCrossSectionGUI:
         Key bindings:
         - Delete/Backspace: Delete selected contact nodes (in edit mode)
         - Home: Reset zoom to fit all data
-        - Escape: Clear selection / exit edit mode
+        - Escape: Cancel drawing / clear selection / exit edit mode
         - +/=: Zoom in
         - -: Zoom out
+        - Ctrl+Z: Undo last contact edit
+        - Ctrl+Y / Ctrl+Shift+Z: Redo last undone edit
         """
         # Handle Home key - reset zoom (always available)
         if event.key == 'home':
@@ -6090,12 +6211,29 @@ class GeologicalCrossSectionGUI:
             self._zoom_view(1.25)  # Zoom out
             return
 
-        # Handle Escape - clear selection or exit edit mode
+        # Handle Ctrl+Z - Undo
+        if event.key == 'ctrl+z':
+            if self.contact_editing:
+                self._undo_contact_edit()
+            return
+
+        # Handle Ctrl+Y or Ctrl+Shift+Z - Redo
+        if event.key in ('ctrl+y', 'ctrl+shift+z', 'ctrl+Z'):
+            if self.contact_editing:
+                self._redo_contact_edit()
+            return
+
+        # Handle Escape - cancel drawing / clear selection / exit edit mode
         if event.key == 'escape':
             if self.contact_editing:
-                if self.selected_contact_nodes:
+                # First priority: cancel any ongoing drawing
+                if getattr(self, 'drawing_contact', None):
+                    self._cancel_drawing()
+                # Second priority: clear selection
+                elif self.selected_contact_nodes:
                     self.selected_contact_nodes = []
                     self._update_node_selection_display()
+                # Third priority: exit edit mode
                 else:
                     self.toggle_contact_editing()
             return
@@ -6401,8 +6539,364 @@ class GeologicalCrossSectionGUI:
         self._update_node_selection_display()
         self.status_var.set(f"Selected segment nodes - delete one to split contact, or drag to adjust")
 
+    def _delete_single_node(self, group_name, node_idx, node_data):
+        """Delete a single node from a contact line with undo support."""
+        polyline = node_data.get('polyline')
+        if not polyline:
+            return
+
+        vertices = list(polyline.vertices)
+        n_points = len(vertices) // 2
+
+        # Need at least 2 points remaining
+        if n_points <= 2:
+            self.status_var.set("Cannot delete - contact needs at least 2 points")
+            return
+
+        vert_idx = node_idx * 2
+        if vert_idx + 1 >= len(vertices):
+            return
+
+        # Save state for undo
+        deleted_x = vertices[vert_idx]
+        deleted_y = vertices[vert_idx + 1]
+        self._push_undo('delete_node', {
+            'group_name': group_name,
+            'node_idx': node_idx,
+            'x': deleted_x,
+            'y': deleted_y,
+            'polyline': polyline
+        })
+
+        # Delete the node
+        del vertices[vert_idx:vert_idx + 2]
+        polyline.vertices = vertices
+
+        # Also update pdf_vertices if present
+        if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+            pdf_verts = list(polyline.pdf_vertices)
+            if vert_idx + 1 < len(pdf_verts):
+                del pdf_verts[vert_idx:vert_idx + 2]
+                polyline.pdf_vertices = pdf_verts
+
+        self.status_var.set(f"Deleted node from {group_name}")
+        self._update_node_selection_display()
+
+    def _insert_node_at_segment(self, group_name, segment_idx, node_data, click_x, click_y):
+        """Insert a new node on a contact line segment at the clicked position."""
+        polyline = node_data.get('polyline')
+        if not polyline:
+            return
+
+        vertices = list(polyline.vertices)
+
+        # Insert position is after segment_idx
+        insert_vert_idx = (segment_idx + 1) * 2
+
+        # Save state for undo
+        self._push_undo('insert_node', {
+            'group_name': group_name,
+            'node_idx': segment_idx + 1,
+            'polyline': polyline
+        })
+
+        # Insert the new node
+        vertices.insert(insert_vert_idx, click_x)
+        vertices.insert(insert_vert_idx + 1, click_y)
+        polyline.vertices = vertices
+
+        # Also update pdf_vertices if present (need to transform coords)
+        if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+            pdf_verts = list(polyline.pdf_vertices)
+            # Note: For now, just insert placeholder - proper transform would need section info
+            # This is a simplification; the PDF coords won't be accurate for new points
+            if insert_vert_idx < len(pdf_verts):
+                pdf_verts.insert(insert_vert_idx, click_x)  # Placeholder
+                pdf_verts.insert(insert_vert_idx + 1, click_y)  # Placeholder
+                polyline.pdf_vertices = pdf_verts
+
+        self.status_var.set(f"Added node to {group_name}")
+        self._update_node_selection_display()
+
+    def _push_undo(self, action_type, data):
+        """Push an action onto the undo stack."""
+        if not hasattr(self, 'contact_undo_stack'):
+            self.contact_undo_stack = []
+        if not hasattr(self, 'contact_redo_stack'):
+            self.contact_redo_stack = []
+
+        self.contact_undo_stack.append((action_type, data))
+        # Clear redo stack when new action is performed
+        self.contact_redo_stack.clear()
+
+        # Limit undo history
+        max_history = getattr(self, 'max_undo_history', 50)
+        if len(self.contact_undo_stack) > max_history:
+            self.contact_undo_stack.pop(0)
+
+    def _undo_contact_edit(self):
+        """Undo the last contact editing action."""
+        if not hasattr(self, 'contact_undo_stack') or not self.contact_undo_stack:
+            self.status_var.set("Nothing to undo")
+            return
+
+        action_type, data = self.contact_undo_stack.pop()
+        polyline = data.get('polyline')
+
+        if action_type == 'delete_node':
+            # Undo delete = re-insert the node
+            node_idx = data['node_idx']
+            x = data['x']
+            y = data['y']
+            vertices = list(polyline.vertices)
+            vert_idx = node_idx * 2
+            vertices.insert(vert_idx, x)
+            vertices.insert(vert_idx + 1, y)
+            polyline.vertices = vertices
+            self.status_var.set(f"Undo: restored deleted node")
+
+        elif action_type == 'insert_node':
+            # Undo insert = delete the node
+            node_idx = data['node_idx']
+            vertices = list(polyline.vertices)
+            vert_idx = node_idx * 2
+            if vert_idx + 1 < len(vertices):
+                # Save for redo
+                deleted_x = vertices[vert_idx]
+                deleted_y = vertices[vert_idx + 1]
+                del vertices[vert_idx:vert_idx + 2]
+                polyline.vertices = vertices
+                # Store for redo
+                data['x'] = deleted_x
+                data['y'] = deleted_y
+            self.status_var.set(f"Undo: removed inserted node")
+
+        elif action_type == 'extend_contact':
+            # Undo extend = remove the added points
+            n_points_added = data['n_points_added']
+            from_start = data['from_start']
+            vertices = list(polyline.vertices)
+            if from_start:
+                # Remove from beginning
+                del vertices[:n_points_added * 2]
+            else:
+                # Remove from end
+                del vertices[-(n_points_added * 2):]
+            polyline.vertices = vertices
+            self.status_var.set(f"Undo: removed {n_points_added} drawn points")
+
+        # Push to redo stack
+        if not hasattr(self, 'contact_redo_stack'):
+            self.contact_redo_stack = []
+        self.contact_redo_stack.append((action_type, data))
+
+        self._update_node_selection_display()
+
+    def _redo_contact_edit(self):
+        """Redo the last undone contact editing action."""
+        if not hasattr(self, 'contact_redo_stack') or not self.contact_redo_stack:
+            self.status_var.set("Nothing to redo")
+            return
+
+        action_type, data = self.contact_redo_stack.pop()
+        polyline = data.get('polyline')
+
+        if action_type == 'delete_node':
+            # Redo delete = delete the node again
+            node_idx = data['node_idx']
+            vertices = list(polyline.vertices)
+            vert_idx = node_idx * 2
+            if vert_idx + 1 < len(vertices):
+                del vertices[vert_idx:vert_idx + 2]
+                polyline.vertices = vertices
+            self.status_var.set(f"Redo: deleted node")
+
+        elif action_type == 'insert_node':
+            # Redo insert = re-insert the node
+            node_idx = data['node_idx']
+            x = data.get('x', 0)
+            y = data.get('y', 0)
+            vertices = list(polyline.vertices)
+            vert_idx = node_idx * 2
+            vertices.insert(vert_idx, x)
+            vertices.insert(vert_idx + 1, y)
+            polyline.vertices = vertices
+            self.status_var.set(f"Redo: inserted node")
+
+        elif action_type == 'extend_contact':
+            # Redo extend = re-add the points
+            points = data['points']
+            from_start = data['from_start']
+            vertices = list(polyline.vertices)
+            flat_points = []
+            for px, py in points:
+                flat_points.extend([px, py])
+            if from_start:
+                vertices = flat_points + vertices
+            else:
+                vertices = vertices + flat_points
+            polyline.vertices = vertices
+            self.status_var.set(f"Redo: re-added {len(points)} drawn points")
+
+        # Push back to undo stack
+        self.contact_undo_stack.append((action_type, data))
+
+        self._update_node_selection_display()
+
+    def _update_drawing_preview(self):
+        """Update the visual preview of points being drawn."""
+        # Remove old preview if exists
+        if hasattr(self, 'drawing_preview_line') and self.drawing_preview_line:
+            try:
+                self.drawing_preview_line.remove()
+            except:
+                pass
+            self.drawing_preview_line = None
+
+        if hasattr(self, 'drawing_preview_points') and self.drawing_preview_points:
+            try:
+                self.drawing_preview_points.remove()
+            except:
+                pass
+            self.drawing_preview_points = None
+
+        if not getattr(self, 'drawing_points', None) or not getattr(self, 'drawing_node_data', None):
+            self.canvas_sections.draw_idle()
+            return
+
+        # Get the last point of the original contact
+        node_data = self.drawing_node_data
+        x_coords = node_data.get('x_coords', [])
+        z_coords = node_data.get('z_coords', [])
+
+        if not x_coords:
+            return
+
+        # Determine starting point based on which end we're extending
+        from_start = getattr(self, 'drawing_from_start', False)
+        if from_start:
+            start_x, start_y = x_coords[0], z_coords[0]
+        else:
+            start_x, start_y = x_coords[-1], z_coords[-1]
+
+        # Build the preview line
+        preview_x = [start_x] + [p[0] for p in self.drawing_points]
+        preview_y = [start_y] + [p[1] for p in self.drawing_points]
+
+        # Find the correct axes
+        axes = self.fig_sections.get_axes() if hasattr(self, 'fig_sections') and self.fig_sections else []
+        if not axes:
+            return
+
+        ax = axes[0]  # Use first axes
+
+        # Draw preview line (dashed, semi-transparent)
+        self.drawing_preview_line, = ax.plot(preview_x, preview_y, 'g--', linewidth=2, alpha=0.7, zorder=100)
+
+        # Draw preview points
+        self.drawing_preview_points = ax.scatter(
+            [p[0] for p in self.drawing_points],
+            [p[1] for p in self.drawing_points],
+            c='lime', s=50, marker='o', zorder=101, edgecolors='black'
+        )
+
+        self.canvas_sections.draw_idle()
+
+    def _finish_drawing(self):
+        """Finish drawing and apply the new points to the contact."""
+        if not getattr(self, 'drawing_contact', None) or not getattr(self, 'drawing_points', None):
+            self.status_var.set("No drawing in progress")
+            return
+
+        if not self.drawing_points:
+            self.status_var.set("No points to add")
+            self._cancel_drawing()
+            return
+
+        node_data = getattr(self, 'drawing_node_data', None)
+        if not node_data:
+            self._cancel_drawing()
+            return
+
+        polyline = node_data.get('polyline')
+        if not polyline:
+            self._cancel_drawing()
+            return
+
+        from_start = getattr(self, 'drawing_from_start', False)
+        vertices = list(polyline.vertices)
+
+        # Save state for undo
+        self._push_undo('extend_contact', {
+            'group_name': self.drawing_contact,
+            'n_points_added': len(self.drawing_points),
+            'from_start': from_start,
+            'points': self.drawing_points.copy(),
+            'polyline': polyline
+        })
+
+        # Flatten new points
+        flat_points = []
+        for px, py in self.drawing_points:
+            flat_points.extend([px, py])
+
+        # Add points to the appropriate end
+        if from_start:
+            # Reverse points so they connect properly
+            flat_points.reverse()
+            # Group pairs and reverse
+            reversed_pairs = []
+            for i in range(0, len(flat_points), 2):
+                reversed_pairs.insert(0, flat_points[i:i+2])
+            flat_points = [coord for pair in reversed_pairs for coord in pair]
+            vertices = flat_points + vertices
+        else:
+            vertices = vertices + flat_points
+
+        polyline.vertices = vertices
+
+        n_added = len(self.drawing_points)
+        self.status_var.set(f"Added {n_added} point(s) to {self.drawing_contact}")
+
+        # Clear drawing state
+        self._clear_drawing_state()
+        self._update_node_selection_display()
+
+    def _cancel_drawing(self):
+        """Cancel the current drawing operation."""
+        if getattr(self, 'drawing_contact', None):
+            self.status_var.set("Drawing cancelled")
+        self._clear_drawing_state()
+        self._update_node_selection_display()
+
+    def _clear_drawing_state(self):
+        """Clear all drawing-related state."""
+        self.drawing_contact = None
+        self.drawing_points = []
+        self.drawing_node_data = None
+        self.drawing_from_start = False
+
+        # Remove preview graphics
+        if hasattr(self, 'drawing_preview_line') and self.drawing_preview_line:
+            try:
+                self.drawing_preview_line.remove()
+            except:
+                pass
+            self.drawing_preview_line = None
+
+        if hasattr(self, 'drawing_preview_points') and self.drawing_preview_points:
+            try:
+                self.drawing_preview_points.remove()
+            except:
+                pass
+            self.drawing_preview_points = None
+
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""
+        # Skip hover processing during section scrolling to prevent unwanted selections
+        if getattr(self, 'scrolling_sections', False):
+            return
+
         if event.inaxes is None:
             # Mouse left the axes - hide tooltip
             if hasattr(self, 'tooltip_annotation') and self.tooltip_annotation:
@@ -7082,19 +7576,29 @@ class GeologicalCrossSectionGUI:
 
     def prev_section(self):
         """Move to previous section."""
+        self.scrolling_sections = True  # Prevent hover selections
         if self.current_center_section > 0:
             self.current_center_section -= 1
             self.section_combo.current(self.current_center_section)
             self.update_section_display()
             self.refresh_feature_browser()
+        # Reset flag after a short delay
+        self.root.after(200, self._reset_scrolling_flag)
 
     def next_section(self):
         """Move to next section."""
+        self.scrolling_sections = True  # Prevent hover selections
         if self.current_center_section < len(self.northings) - 1:
             self.current_center_section += 1
             self.section_combo.current(self.current_center_section)
             self.update_section_display()
             self.refresh_feature_browser()
+        # Reset flag after a short delay
+        self.root.after(200, self._reset_scrolling_flag)
+
+    def _reset_scrolling_flag(self):
+        """Reset the scrolling flag."""
+        self.scrolling_sections = False
 
     def jump_to_section(self, index):
         """Jump to specific section index."""
