@@ -56,6 +56,68 @@ if __name__ == "__main__" or "debug" in sys.argv:
     logger.setLevel(logging.DEBUG)
 
 
+class CollapsibleFrame(ttk.Frame):
+    """A frame that can be collapsed/expanded with a toggle button."""
+
+    def __init__(self, parent, title="", collapsed=False, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        self.is_collapsed = collapsed
+        self._title = title
+
+        # Header frame with toggle button
+        self.header = ttk.Frame(self)
+        self.header.pack(fill=tk.X)
+
+        # Toggle button with arrow indicator
+        self.toggle_btn = ttk.Button(
+            self.header,
+            text=self._get_toggle_text(),
+            command=self.toggle,
+            width=3
+        )
+        self.toggle_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        # Title label (clickable)
+        self.title_label = ttk.Label(
+            self.header,
+            text=title,
+            font=("Arial", 9, "bold"),
+            cursor="hand2"
+        )
+        self.title_label.pack(side=tk.LEFT, fill=tk.X)
+        self.title_label.bind("<Button-1>", lambda e: self.toggle())
+
+        # Content frame
+        self.content = ttk.Frame(self)
+        if not collapsed:
+            self.content.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+    def _get_toggle_text(self):
+        """Get the arrow indicator text."""
+        return "▼" if not self.is_collapsed else "▶"
+
+    def toggle(self):
+        """Toggle collapsed state."""
+        self.is_collapsed = not self.is_collapsed
+        self.toggle_btn.config(text=self._get_toggle_text())
+
+        if self.is_collapsed:
+            self.content.pack_forget()
+        else:
+            self.content.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+    def expand(self):
+        """Expand the frame."""
+        if self.is_collapsed:
+            self.toggle()
+
+    def collapse(self):
+        """Collapse the frame."""
+        if not self.is_collapsed:
+            self.toggle()
+
+
 class GeologicalCrossSectionGUI:
     """Main GUI application for geological cross-section analysis with integrated section viewer."""
 
@@ -114,6 +176,13 @@ class GeologicalCrossSectionGUI:
         self.selected_contacts = set()  # Selected contacts (group names)
         self.contact_node_patches = {}  # Maps matplotlib scatter artists to node data
         self.contact_editing = False  # True when editing contact nodes
+
+        # Contact node editing state
+        self.selected_contact_nodes = []  # List of (group_name, node_idx) for selected nodes
+        self.dragging_node = None  # (group_name, node_idx) when dragging a node
+        self.drag_start_pos = None  # (x, y) when drag started
+        self.last_click_time = 0  # For double-click detection
+        self.last_click_pos = None  # For double-click detection
 
         # Classification mode state
         self.classification_mode = "none"  # "none", "polygon", "fault", "contact"
@@ -557,6 +626,11 @@ class GeologicalCrossSectionGUI:
         canvas_widget.bind("<Button-5>", self.on_mousewheel)  # Linux
         self.canvas_sections.mpl_connect("pick_event", self.on_pick)
         self.canvas_sections.mpl_connect("motion_notify_event", self.on_section_hover)
+        self.canvas_sections.mpl_connect("button_press_event", self.on_section_button_press)
+        self.canvas_sections.mpl_connect("button_release_event", self.on_section_button_release)
+        self.canvas_sections.mpl_connect("key_press_event", self.on_section_key_press)
+        # Enable keyboard focus for canvas
+        canvas_widget.bind("<Button-1>", lambda e: canvas_widget.focus_set())
         
         # Tooltip annotation (hidden initially)
         self.tooltip_annotation = None
@@ -565,125 +639,13 @@ class GeologicalCrossSectionGUI:
         assignment_outer = ttk.Frame(content_paned)
         content_paned.add(assignment_outer, weight=1)
 
-        # Compact actions bar at TOP (always visible)
-        actions_frame = ttk.Frame(assignment_outer)
-        actions_frame.pack(fill=tk.X, padx=5, pady=3)
-        
-        # Export actions (left side)
-        export_frame = ttk.LabelFrame(actions_frame, text="Export", padding=2)
-        export_frame.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(export_frame, text="DXF", width=5,
-                   command=self._export_all_sections_dxf).pack(side=tk.LEFT, padx=1)
-        ttk.Button(export_frame, text="GeoTIFF", width=7,
-                   command=self.export_geotiff).pack(side=tk.LEFT, padx=1)
-        ttk.Button(export_frame, text="To PDF", width=6,
-                   command=self.write_assignments_to_pdf).pack(side=tk.LEFT, padx=1)
-        
-        # Config actions
-        config_frame = ttk.LabelFrame(actions_frame, text="Config", padding=2)
-        config_frame.pack(side=tk.LEFT, padx=2)
-        
-        ttk.Button(config_frame, text="Save", width=5,
-                   command=self.save_strat_column).pack(side=tk.LEFT, padx=1)
-        ttk.Button(config_frame, text="Load", width=5,
-                   command=self.load_strat_column).pack(side=tk.LEFT, padx=1)
-        
-        # Auto-assign
-        ttk.Button(actions_frame, text="Auto-Name", width=9,
-                   command=self._auto_assign_from_pdf_names).pack(side=tk.LEFT, padx=3)
+        # ========== TOP SECTION: Classification Mode (always visible) ==========
+        top_frame = ttk.Frame(assignment_outer)
+        top_frame.pack(fill=tk.X, padx=5, pady=5)
 
-        # Mode indicator (right side)
-        self.mode_label = ttk.Label(actions_frame, text="Mode: View Only", font=("Arial", 9, "bold"))
-        self.mode_label.pack(side=tk.RIGHT, padx=5)
-
-        # Scrollable canvas for the rest of the controls
-        right_canvas = tk.Canvas(assignment_outer, highlightthickness=0)
-        right_scrollbar = ttk.Scrollbar(assignment_outer, orient="vertical", command=right_canvas.yview)
-        assignment_frame = ttk.Frame(right_canvas)
-        
-        assignment_frame.bind(
-            "<Configure>",
-            lambda e: right_canvas.configure(scrollregion=right_canvas.bbox("all"))
-        )
-        
-        right_canvas.create_window((0, 0), window=assignment_frame, anchor="nw")
-        right_canvas.configure(yscrollcommand=right_scrollbar.set)
-        
-        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Enable mousewheel scrolling
-        def _on_right_mousewheel(event):
-            right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        right_canvas.bind_all("<MouseWheel>", _on_right_mousewheel, add='+')
-
-        # Feature browser - show all extracted items (consolidated)
-        browser_frame = ttk.LabelFrame(assignment_frame, text="Extracted Features", padding=5)
-        browser_frame.pack(fill=tk.X, padx=5, pady=5)
-        
-        # Feature tree showing all polygons, faults, and contacts
-        feature_tree_frame = ttk.Frame(browser_frame)
-        feature_tree_frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.section_feature_tree = ttk.Treeview(
-            feature_tree_frame,
-            columns=("type", "formation", "assigned"),
-            height=10,
-            selectmode=tk.EXTENDED
-        )
-        self.section_feature_tree.heading("#0", text="Name")
-        self.section_feature_tree.heading("type", text="Type")
-        self.section_feature_tree.heading("formation", text="Original")
-        self.section_feature_tree.heading("assigned", text="Assigned")
-        self.section_feature_tree.column("#0", width=120)
-        self.section_feature_tree.column("type", width=60)
-        self.section_feature_tree.column("formation", width=80)
-        self.section_feature_tree.column("assigned", width=80)
-        
-        feature_scrollbar = ttk.Scrollbar(feature_tree_frame, orient=tk.VERTICAL, 
-                                          command=self.section_feature_tree.yview)
-        self.section_feature_tree.configure(yscrollcommand=feature_scrollbar.set)
-        self.section_feature_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        feature_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Bind selection event
-        self.section_feature_tree.bind("<<TreeviewSelect>>", self.on_feature_tree_select)
-        
-        # Consolidated selection controls (grouped)
-        selection_controls_frame = ttk.Frame(browser_frame)
-        selection_controls_frame.pack(fill=tk.X, pady=3)
-        
-        # Row 1: List controls
-        row1 = ttk.Frame(selection_controls_frame)
-        row1.pack(fill=tk.X, pady=1)
-        ttk.Button(row1, text="Refresh", width=8,
-                   command=self.refresh_feature_browser).pack(side=tk.LEFT, padx=1)
-        ttk.Button(row1, text="Highlight", width=8,
-                   command=self.highlight_selected_features).pack(side=tk.LEFT, padx=1)
-        ttk.Button(row1, text="Select Similar", width=10,
-                   command=self.select_similar).pack(side=tk.LEFT, padx=1)
-        
-        # Row 2: Selection actions
-        row2 = ttk.Frame(selection_controls_frame)
-        row2.pack(fill=tk.X, pady=1)
-        ttk.Button(row2, text="Clear Selection", width=12,
-                   command=self.clear_selection).pack(side=tk.LEFT, padx=1)
-        ttk.Button(row2, text="Unassign Selected", width=14,
-                   command=self.unassign_selected).pack(side=tk.LEFT, padx=1)
-
-        # Row 3: Bulk assignment
-        row3 = ttk.Frame(selection_controls_frame)
-        row3.pack(fill=tk.X, pady=1)
-        ttk.Label(row3, text="Assign to:").pack(side=tk.LEFT, padx=1)
-        self.bulk_assign_combo = ttk.Combobox(row3, state="readonly", width=15)
-        self.bulk_assign_combo.pack(side=tk.LEFT, padx=1)
-        ttk.Button(row3, text="Assign", width=8,
-                   command=self.bulk_assign_selected).pack(side=tk.LEFT, padx=1)
-
-        # Classification mode selection
-        mode_frame = ttk.LabelFrame(assignment_frame, text="Classification Mode", padding=5)
-        mode_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Classification mode selection (always visible at top)
+        mode_frame = ttk.LabelFrame(top_frame, text="Classification Mode", padding=5)
+        mode_frame.pack(fill=tk.X)
 
         self.mode_var = tk.StringVar(value="none")
         mode_row = ttk.Frame(mode_frame)
@@ -705,20 +667,131 @@ class GeologicalCrossSectionGUI:
             value="contact", command=self.on_classification_mode_changed
         ).pack(side=tk.LEFT, padx=3)
 
-        # Units frame with prospect grouping
-        units_frame = ttk.LabelFrame(assignment_frame, text="Geological Units (by Prospect)", padding=5)
-        units_frame.pack(fill=tk.BOTH, padx=5, pady=5, expand=True)
+        # Mode indicator
+        self.mode_label = ttk.Label(mode_frame, text="Mode: View Only", font=("Arial", 9, "bold"))
+        self.mode_label.pack(side=tk.RIGHT, padx=5)
 
-        # Prospect management buttons
-        prospect_btn_frame = ttk.Frame(units_frame)
+        # Assignment info (status bar within classification mode)
+        info_row = ttk.Frame(mode_frame)
+        info_row.pack(fill=tk.X, pady=(5, 0))
+        self.assignment_label = ttk.Label(info_row, text="Click a unit/fault button, then click items",
+                                          wraplength=250)
+        self.assignment_label.pack(side=tk.LEFT)
+        self.count_label = ttk.Label(info_row, text="0 selected", font=("Arial", 9, "bold"))
+        self.count_label.pack(side=tk.RIGHT)
+
+        # ========== MIDDLE SECTION: Scrollable collapsible panels ==========
+        # Scrollable canvas for the collapsible sections
+        right_canvas = tk.Canvas(assignment_outer, highlightthickness=0)
+        right_scrollbar = ttk.Scrollbar(assignment_outer, orient="vertical", command=right_canvas.yview)
+        assignment_frame = ttk.Frame(right_canvas)
+
+        assignment_frame.bind(
+            "<Configure>",
+            lambda e: right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+        )
+
+        right_canvas.create_window((0, 0), window=assignment_frame, anchor="nw")
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
+
+        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Store reference for width updates
+        self.right_canvas = right_canvas
+        self.assignment_frame = assignment_frame
+
+        # Enable mousewheel scrolling
+        def _on_right_mousewheel(event):
+            right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        right_canvas.bind_all("<MouseWheel>", _on_right_mousewheel, add='+')
+
+        # ===== 1. EXTRACTED FEATURES (collapsible) =====
+        self.features_collapsible = CollapsibleFrame(assignment_frame, title="Extracted Features")
+        self.features_collapsible.pack(fill=tk.X, padx=5, pady=3)
+        browser_content = self.features_collapsible.content
+
+        # Feature tree showing all polygons, faults, and contacts
+        feature_tree_frame = ttk.Frame(browser_content)
+        feature_tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.section_feature_tree = ttk.Treeview(
+            feature_tree_frame,
+            columns=("type", "formation", "assigned"),
+            height=8,
+            selectmode=tk.EXTENDED
+        )
+        self.section_feature_tree.heading("#0", text="Name")
+        self.section_feature_tree.heading("type", text="Type")
+        self.section_feature_tree.heading("formation", text="Original")
+        self.section_feature_tree.heading("assigned", text="Assigned")
+        self.section_feature_tree.column("#0", width=100, minwidth=60)
+        self.section_feature_tree.column("type", width=50, minwidth=40)
+        self.section_feature_tree.column("formation", width=70, minwidth=50)
+        self.section_feature_tree.column("assigned", width=70, minwidth=50)
+
+        feature_scrollbar = ttk.Scrollbar(feature_tree_frame, orient=tk.VERTICAL,
+                                          command=self.section_feature_tree.yview)
+        self.section_feature_tree.configure(yscrollcommand=feature_scrollbar.set)
+        self.section_feature_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        feature_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind selection event
+        self.section_feature_tree.bind("<<TreeviewSelect>>", self.on_feature_tree_select)
+
+        # Selection controls (compact rows)
+        selection_controls_frame = ttk.Frame(browser_content)
+        selection_controls_frame.pack(fill=tk.X, pady=3)
+
+        # Row 1: List controls
+        row1 = ttk.Frame(selection_controls_frame)
+        row1.pack(fill=tk.X, pady=1)
+        ttk.Button(row1, text="Refresh", width=7,
+                   command=self.refresh_feature_browser).pack(side=tk.LEFT, padx=1)
+        ttk.Button(row1, text="Highlight", width=7,
+                   command=self.highlight_selected_features).pack(side=tk.LEFT, padx=1)
+        ttk.Button(row1, text="Similar", width=6,
+                   command=self.select_similar).pack(side=tk.LEFT, padx=1)
+
+        # Row 2: Selection actions
+        row2 = ttk.Frame(selection_controls_frame)
+        row2.pack(fill=tk.X, pady=1)
+        ttk.Button(row2, text="Clear", width=6,
+                   command=self.clear_selection).pack(side=tk.LEFT, padx=1)
+        ttk.Button(row2, text="Unassign", width=7,
+                   command=self.unassign_selected).pack(side=tk.LEFT, padx=1)
+
+        # Row 3: Bulk assignment
+        row3 = ttk.Frame(selection_controls_frame)
+        row3.pack(fill=tk.X, pady=1)
+        ttk.Label(row3, text="Assign:").pack(side=tk.LEFT, padx=1)
+        self.bulk_assign_combo = ttk.Combobox(row3, state="readonly", width=12)
+        self.bulk_assign_combo.pack(side=tk.LEFT, padx=1, fill=tk.X, expand=True)
+        ttk.Button(row3, text="Go", width=3,
+                   command=self.bulk_assign_selected).pack(side=tk.LEFT, padx=1)
+
+        # ===== 2. GEOLOGICAL UNITS (collapsible) =====
+        self.units_collapsible = CollapsibleFrame(assignment_frame, title="Geological Units")
+        self.units_collapsible.pack(fill=tk.X, padx=5, pady=3)
+        units_content = self.units_collapsible.content
+
+        # Prospect management buttons (compact)
+        prospect_btn_frame = ttk.Frame(units_content)
         prospect_btn_frame.pack(fill=tk.X, pady=2)
-        ttk.Button(prospect_btn_frame, text="+ Add Prospect", command=self.add_new_prospect).pack(side=tk.LEFT, padx=2)
-        ttk.Button(prospect_btn_frame, text="+ Add Unit", command=self.add_new_unit).pack(side=tk.LEFT, padx=2)
-        ttk.Button(prospect_btn_frame, text="Expand All", command=self.expand_all_prospects).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(prospect_btn_frame, text="Collapse All", command=self.collapse_all_prospects).pack(side=tk.RIGHT, padx=2)
+        ttk.Button(prospect_btn_frame, text="+Prospect", width=9,
+                   command=self.add_new_prospect).pack(side=tk.LEFT, padx=1)
+        ttk.Button(prospect_btn_frame, text="+Unit", width=6,
+                   command=self.add_new_unit).pack(side=tk.LEFT, padx=1)
+        ttk.Button(prospect_btn_frame, text="▼", width=2,
+                   command=self.expand_all_prospects).pack(side=tk.RIGHT, padx=1)
+        ttk.Button(prospect_btn_frame, text="▶", width=2,
+                   command=self.collapse_all_prospects).pack(side=tk.RIGHT, padx=1)
 
         # Scrollable canvas for units
-        self.units_canvas = tk.Canvas(units_frame, height=200, highlightthickness=0)
+        units_frame = ttk.Frame(units_content)
+        units_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.units_canvas = tk.Canvas(units_frame, height=150, highlightthickness=0)
         units_scrollbar = ttk.Scrollbar(units_frame, orient="vertical", command=self.units_canvas.yview)
         self.units_inner = ttk.Frame(self.units_canvas)
 
@@ -731,22 +804,26 @@ class GeologicalCrossSectionGUI:
 
         self.units_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         units_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
         # Enable mousewheel scrolling on units canvas
         def _on_units_mousewheel(event):
             self.units_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         self.units_canvas.bind("<MouseWheel>", _on_units_mousewheel)
         self.units_inner.bind("<MouseWheel>", _on_units_mousewheel)
-        
+
         # Track expanded/collapsed state per prospect
         self.prospect_expanded = {}  # {prospect_name: bool}
 
-        # Faults frame
-        faults_frame = ttk.LabelFrame(assignment_frame, text="Faults", padding=5)
-        faults_frame.pack(fill=tk.X, padx=5, pady=5)
+        # ===== 3. FAULTS (collapsible) =====
+        self.faults_collapsible = CollapsibleFrame(assignment_frame, title="Faults")
+        self.faults_collapsible.pack(fill=tk.X, padx=5, pady=3)
+        faults_content = self.faults_collapsible.content
 
-        faults_canvas = tk.Canvas(faults_frame, height=100)
-        faults_scrollbar = ttk.Scrollbar(faults_frame, orient="vertical", command=faults_canvas.yview)
+        faults_scroll_frame = ttk.Frame(faults_content)
+        faults_scroll_frame.pack(fill=tk.BOTH, expand=True)
+
+        faults_canvas = tk.Canvas(faults_scroll_frame, height=80, highlightthickness=0)
+        faults_scrollbar = ttk.Scrollbar(faults_scroll_frame, orient="vertical", command=faults_canvas.yview)
         self.faults_inner = ttk.Frame(faults_canvas)
 
         self.faults_inner.bind(
@@ -759,18 +836,39 @@ class GeologicalCrossSectionGUI:
         faults_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         faults_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Button(faults_frame, text="+ Add Fault", command=self.add_new_fault).pack(fill=tk.X, pady=2)
+        ttk.Button(faults_content, text="+ Add Fault", command=self.add_new_fault).pack(fill=tk.X, pady=2)
 
-        # Assignment info (simplified)
-        info_frame = ttk.Frame(assignment_frame)
-        info_frame.pack(fill=tk.X, padx=5, pady=3)
-        
-        self.assignment_label = ttk.Label(info_frame, text="Click a unit/fault button, then click items to assign")
-        self.assignment_label.pack(side=tk.LEFT)
-        
-        self.count_label = ttk.Label(info_frame, text="0 selected", font=("Arial", 9, "bold"))
-        self.count_label.pack(side=tk.RIGHT)
-        
+        # ===== 4. EXPORT & CONFIG (bottom, always visible) =====
+        bottom_frame = ttk.Frame(assignment_frame)
+        bottom_frame.pack(fill=tk.X, padx=5, pady=5, side=tk.BOTTOM)
+
+        # Separator
+        ttk.Separator(bottom_frame, orient="horizontal").pack(fill=tk.X, pady=5)
+
+        # Export row
+        export_row = ttk.Frame(bottom_frame)
+        export_row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(export_row, text="Export:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(export_row, text="DXF", width=5,
+                   command=self._export_all_sections_dxf).pack(side=tk.LEFT, padx=1)
+        ttk.Button(export_row, text="GeoTIFF", width=7,
+                   command=self.export_geotiff).pack(side=tk.LEFT, padx=1)
+        ttk.Button(export_row, text="To PDF", width=6,
+                   command=self.write_assignments_to_pdf).pack(side=tk.LEFT, padx=1)
+
+        # Config row
+        config_row = ttk.Frame(bottom_frame)
+        config_row.pack(fill=tk.X, pady=2)
+
+        ttk.Label(config_row, text="Config:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(config_row, text="Save", width=5,
+                   command=self.save_strat_column).pack(side=tk.LEFT, padx=1)
+        ttk.Button(config_row, text="Load", width=5,
+                   command=self.load_strat_column).pack(side=tk.LEFT, padx=1)
+        ttk.Button(config_row, text="Auto-Name", width=9,
+                   command=self._auto_assign_from_pdf_names).pack(side=tk.LEFT, padx=3)
+
         # Hidden listboxes for compatibility (not displayed but used by other methods)
         self.selected_listbox = tk.Listbox(assignment_frame, height=0)
         self.polyline_listbox = tk.Listbox(assignment_frame, height=0)
@@ -2621,25 +2719,40 @@ class GeologicalCrossSectionGUI:
 
                                 # Draw nodes when in contact editing mode
                                 if self.contact_editing and (is_selected or mode == 'contact'):
+                                    # Determine colors based on selection state
+                                    node_colors = ['yellow'] * len(x)
+                                    node_sizes = [40] * len(x)
+                                    node_edge_widths = [0.5] * len(x)
+
+                                    # Check for selected nodes (by group_name and index)
+                                    if hasattr(self, 'selected_contact_nodes') and self.selected_contact_nodes:
+                                        for sel_group, sel_idx in self.selected_contact_nodes:
+                                            if sel_group == group_name and sel_idx < len(x):
+                                                node_colors[sel_idx] = 'cyan'
+                                                node_sizes[sel_idx] = 60
+                                                node_edge_widths[sel_idx] = 2.0
+
                                     node_scatter = ax.scatter(
                                         x, z,
-                                        c='yellow',
-                                        s=40,
+                                        c=node_colors,
+                                        s=node_sizes,
                                         edgecolors='black',
-                                        linewidths=0.5,
+                                        linewidths=node_edge_widths,
                                         zorder=15,
                                         picker=5,
                                     )
-                                    # Store node info for each point
-                                    for node_idx in range(len(x)):
-                                        self.contact_node_patches[id(node_scatter)] = {
-                                            "scatter": node_scatter,
-                                            "group_name": group_name,
-                                            "polyline": polyline,
-                                            "northing": northing,
-                                            "x_coords": x,
-                                            "z_coords": z,
-                                        }
+
+                                    scatter_id = id(node_scatter)
+
+                                    # Store node info
+                                    self.contact_node_patches[scatter_id] = {
+                                        "scatter": node_scatter,
+                                        "group_name": group_name,
+                                        "polyline": polyline,
+                                        "northing": northing,
+                                        "x_coords": x,
+                                        "z_coords": z,
+                                    }
 
             # Draw model boundary if available and enabled
             if self.show_boundaries_var.get() and northing in self.model_boundaries:
@@ -5300,16 +5413,30 @@ class GeologicalCrossSectionGUI:
         # Get the mouse event to check for right-click
         mouse_event = event.mouseevent
         is_right_click = mouse_event.button == 3
-        
+
+        # In contact editing mode, ignore polygon/polyline picks - only handle nodes
+        if self.contact_editing:
+            # Only process contact node picks
+            if hasattr(event.artist, 'get_offsets'):
+                artist_id = id(event.artist)
+                if artist_id in self.contact_node_patches:
+                    node_data = self.contact_node_patches[artist_id]
+                    if hasattr(event, 'ind') and len(event.ind) > 0:
+                        clicked_idx = event.ind[0]
+                        if is_right_click:
+                            # Right-click deletes the node
+                            self._delete_contact_node(node_data, clicked_idx)
+            return  # Skip all other pick handling in contact editing mode
+
         if event.artist in self.unit_patches:
             unit_data = self.unit_patches[event.artist]
             unit_name = unit_data["name"]
-            
+
             # Right-click to clear assignment (works in any mode)
             if is_right_click:
                 current_formation = self.all_geological_units.get(unit_name, {}).get("formation", "UNKNOWN")
                 if current_formation != "UNKNOWN" and not current_formation.startswith("UNIT"):
-                    if messagebox.askyesno("Clear Assignment", 
+                    if messagebox.askyesno("Clear Assignment",
                                           f"Clear assignment '{current_formation}' from {unit_name}?"):
                         self.clear_polygon_assignment(unit_name)
                 return
@@ -5485,12 +5612,317 @@ class GeologicalCrossSectionGUI:
 
     def toggle_contact_editing(self):
         """Toggle contact node editing mode."""
+        # Save current zoom/pan state for all axes
+        saved_limits = {}
+        if hasattr(self, 'fig_sections') and self.fig_sections:
+            for ax in self.fig_sections.get_axes():
+                saved_limits[ax] = (ax.get_xlim(), ax.get_ylim())
+
         self.contact_editing = not self.contact_editing
+
+        # Clear selection state when toggling
+        self.selected_contact_nodes = []
+        self.dragging_node = None
+
         if self.contact_editing:
-            self.status_var.set("Contact editing ON - right-click nodes to delete")
+            self.status_var.set("Contact editing ON - click to select, drag to move, right-click to delete, Del key to delete selection")
         else:
             self.status_var.set("Contact editing OFF")
+
         self.update_section_display()
+
+        # Restore zoom/pan state
+        if saved_limits:
+            for ax, (xlim, ylim) in saved_limits.items():
+                try:
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                except:
+                    pass
+            self.canvas_sections.draw_idle()
+
+    def on_section_button_press(self, event):
+        """Handle mouse button press for contact node editing."""
+        if not self.contact_editing or event.inaxes is None:
+            return
+
+        import time
+        current_time = time.time()
+
+        # Check for double-click (within 0.3 seconds and 10 pixels)
+        is_double_click = False
+        if self.last_click_time and self.last_click_pos:
+            time_diff = current_time - self.last_click_time
+            if time_diff < 0.3 and event.xdata and event.ydata:
+                pos_diff = ((event.xdata - self.last_click_pos[0])**2 +
+                           (event.ydata - self.last_click_pos[1])**2)**0.5
+                if pos_diff < 10:  # Within 10 units
+                    is_double_click = True
+
+        self.last_click_time = current_time
+        self.last_click_pos = (event.xdata, event.ydata) if event.xdata else None
+
+        if event.button == 1:  # Left click
+            # Find if we clicked on a contact node
+            clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+
+            if clicked_node:
+                group_name, node_idx, node_data = clicked_node
+
+                if is_double_click:
+                    # Double-click: select all nodes in this contact
+                    self._select_all_contact_nodes(group_name, node_data)
+                else:
+                    # Single click: toggle selection or start drag
+                    node_key = (group_name, node_idx)
+                    if node_key in self.selected_contact_nodes:
+                        # Already selected - start dragging
+                        self.dragging_node = node_key
+                        self.drag_start_pos = (event.xdata, event.ydata)
+                    else:
+                        # Not selected - select it (add to selection if shift held)
+                        if not event.key == 'shift':
+                            self.selected_contact_nodes = []
+                        self.selected_contact_nodes.append(node_key)
+                        # Also prepare for potential drag
+                        self.dragging_node = node_key
+                        self.drag_start_pos = (event.xdata, event.ydata)
+
+                    self._update_node_selection_display()
+            else:
+                # Clicked on empty space - check if clicked on contact line to break it
+                clicked_line = self._find_contact_line_at(event.xdata, event.ydata)
+                if clicked_line:
+                    group_name, segment_idx, node_data = clicked_line
+                    self._break_contact_at_segment(group_name, segment_idx, node_data)
+                else:
+                    # Clear selection
+                    self.selected_contact_nodes = []
+                    self._update_node_selection_display()
+
+    def on_section_button_release(self, event):
+        """Handle mouse button release for contact node editing."""
+        if not self.contact_editing:
+            return
+
+        if self.dragging_node and self.drag_start_pos and event.xdata and event.ydata:
+            # Check if we actually moved (not just clicked)
+            dx = event.xdata - self.drag_start_pos[0]
+            dy = event.ydata - self.drag_start_pos[1]
+            if abs(dx) > 1 or abs(dy) > 1:  # Moved more than 1 unit
+                # Move all selected nodes by the same delta
+                self._move_selected_nodes(dx, dy)
+
+        self.dragging_node = None
+        self.drag_start_pos = None
+
+    def on_section_key_press(self, event):
+        """Handle key press events for contact node editing."""
+        if not self.contact_editing:
+            return
+
+        if event.key in ('delete', 'backspace'):
+            if self.selected_contact_nodes:
+                self._delete_selected_nodes()
+
+    def _find_contact_node_at(self, x, y, tolerance=8):
+        """Find a contact node near the given coordinates."""
+        if x is None or y is None:
+            return None
+
+        for scatter_id, node_data in self.contact_node_patches.items():
+            x_coords = node_data.get('x_coords', [])
+            z_coords = node_data.get('z_coords', [])
+            group_name = node_data.get('group_name', '')
+
+            for idx, (nx, nz) in enumerate(zip(x_coords, z_coords)):
+                dist = ((x - nx)**2 + (y - nz)**2)**0.5
+                if dist < tolerance:
+                    return (group_name, idx, node_data)
+
+        return None
+
+    def _find_contact_line_at(self, x, y, tolerance=5):
+        """Find a contact line segment near the given coordinates."""
+        if x is None or y is None:
+            return None
+
+        for scatter_id, node_data in self.contact_node_patches.items():
+            x_coords = node_data.get('x_coords', [])
+            z_coords = node_data.get('z_coords', [])
+            group_name = node_data.get('group_name', '')
+
+            # Check each line segment
+            for idx in range(len(x_coords) - 1):
+                x1, y1 = x_coords[idx], z_coords[idx]
+                x2, y2 = x_coords[idx + 1], z_coords[idx + 1]
+
+                # Point-to-segment distance
+                dist = self._point_to_segment_distance(x, y, x1, y1, x2, y2)
+                if dist < tolerance:
+                    return (group_name, idx, node_data)
+
+        return None
+
+    def _point_to_segment_distance(self, px, py, x1, y1, x2, y2):
+        """Calculate distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+        dx = x2 - x1
+        dy = y2 - y1
+        seg_len_sq = dx*dx + dy*dy
+
+        if seg_len_sq < 0.0001:
+            return ((px - x1)**2 + (py - y1)**2)**0.5
+
+        t = max(0, min(1, ((px - x1)*dx + (py - y1)*dy) / seg_len_sq))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+
+        return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
+
+    def _select_all_contact_nodes(self, group_name, node_data):
+        """Select all nodes in a contact (by group_name)."""
+        x_coords = node_data.get('x_coords', [])
+
+        self.selected_contact_nodes = [(group_name, idx) for idx in range(len(x_coords))]
+        self._update_node_selection_display()
+
+        self.status_var.set(f"Selected all {len(x_coords)} nodes in {group_name}")
+
+    def _update_node_selection_display(self):
+        """Update the visual display to show selected nodes."""
+        # Save zoom
+        saved_limits = {}
+        if hasattr(self, 'fig_sections') and self.fig_sections:
+            for ax in self.fig_sections.get_axes():
+                saved_limits[ax] = (ax.get_xlim(), ax.get_ylim())
+
+        # Redraw with selection highlighting
+        self.update_section_display()
+
+        # Restore zoom
+        if saved_limits:
+            for ax, (xlim, ylim) in saved_limits.items():
+                try:
+                    ax.set_xlim(xlim)
+                    ax.set_ylim(ylim)
+                except:
+                    pass
+            self.canvas_sections.draw_idle()
+
+        n_selected = len(self.selected_contact_nodes)
+        if n_selected > 0:
+            self.status_var.set(f"{n_selected} node(s) selected - drag to move, Del to delete")
+
+    def _move_selected_nodes(self, dx, dy):
+        """Move all selected nodes by the given delta."""
+        if not self.selected_contact_nodes:
+            return
+
+        # Group nodes by group_name (polyline)
+        nodes_by_group = {}
+        for group_name, node_idx in self.selected_contact_nodes:
+            if group_name not in nodes_by_group:
+                nodes_by_group[group_name] = []
+            nodes_by_group[group_name].append(node_idx)
+
+        # Find polylines by group_name
+        for scatter_id, node_data in self.contact_node_patches.items():
+            group_name = node_data.get('group_name', '')
+            if group_name not in nodes_by_group:
+                continue
+
+            polyline = node_data.get('polyline')
+            if not polyline:
+                continue
+
+            # Update vertices for selected nodes in this group
+            vertices = list(polyline.vertices)
+            for node_idx in nodes_by_group[group_name]:
+                vert_idx = node_idx * 2
+                if vert_idx + 1 < len(vertices):
+                    vertices[vert_idx] += dx      # x/easting
+                    vertices[vert_idx + 1] += dy  # y/rl
+
+            polyline.vertices = vertices
+
+        self.status_var.set(f"Moved {len(self.selected_contact_nodes)} node(s)")
+        self._update_node_selection_display()
+
+    def _delete_selected_nodes(self):
+        """Delete all selected nodes."""
+        if not self.selected_contact_nodes:
+            return
+
+        # Group nodes by group_name and sort by index descending (delete from end first)
+        nodes_by_group = {}
+        for group_name, node_idx in self.selected_contact_nodes:
+            if group_name not in nodes_by_group:
+                nodes_by_group[group_name] = []
+            nodes_by_group[group_name].append(node_idx)
+
+        deleted_count = 0
+
+        # Find polylines by group_name
+        for scatter_id, node_data in self.contact_node_patches.items():
+            group_name = node_data.get('group_name', '')
+            if group_name not in nodes_by_group:
+                continue
+
+            polyline = node_data.get('polyline')
+            if not polyline:
+                continue
+
+            vertices = list(polyline.vertices)
+            n_points = len(vertices) // 2
+
+            # Sort indices descending to delete from end first
+            for node_idx in sorted(nodes_by_group[group_name], reverse=True):
+                # Need at least 2 points remaining
+                if n_points <= 2:
+                    break
+
+                vert_idx = node_idx * 2
+                if vert_idx + 1 < len(vertices):
+                    del vertices[vert_idx:vert_idx + 2]
+                    n_points -= 1
+                    deleted_count += 1
+
+            polyline.vertices = vertices
+
+            # Also update pdf_vertices if present
+            if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+                pdf_verts = list(polyline.pdf_vertices)
+                for node_idx in sorted(nodes_by_group[group_name], reverse=True):
+                    vert_idx = node_idx * 2
+                    if vert_idx + 1 < len(pdf_verts):
+                        del pdf_verts[vert_idx:vert_idx + 2]
+                polyline.pdf_vertices = pdf_verts
+
+        self.selected_contact_nodes = []
+        self.status_var.set(f"Deleted {deleted_count} node(s)")
+        self._update_node_selection_display()
+
+    def _break_contact_at_segment(self, group_name, segment_idx, node_data):
+        """Break a contact line at the given segment (between segment_idx and segment_idx+1)."""
+        polyline = node_data.get('polyline')
+        if not polyline:
+            return
+
+        vertices = list(polyline.vertices)
+        n_points = len(vertices) // 2
+
+        if n_points < 3 or segment_idx >= n_points - 1:
+            self.status_var.set("Cannot break contact - too few points")
+            return
+
+        # Select the nodes on either side of the clicked segment
+        # This allows the user to then delete one to split the contact
+        self.selected_contact_nodes = [
+            (group_name, segment_idx),
+            (group_name, segment_idx + 1)
+        ]
+        self._update_node_selection_display()
+        self.status_var.set(f"Selected segment nodes - delete one to split contact, or drag to adjust")
 
     def on_section_hover(self, event):
         """Handle mouse hover over section display for tooltips."""

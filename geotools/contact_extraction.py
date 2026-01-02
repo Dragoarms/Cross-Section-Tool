@@ -177,6 +177,44 @@ class ContactMidpoint(NamedTuple):
     distance: float  # Distance between the two boundary points
 
 
+def _get_exterior_rings(geom) -> List[LineString]:
+    """
+    Get exterior ring(s) from a geometry, handling both Polygon and MultiPolygon.
+
+    Args:
+        geom: A Shapely Polygon or MultiPolygon
+
+    Returns:
+        List of exterior rings as LineStrings
+    """
+    from shapely.geometry import Polygon, MultiPolygon
+
+    if geom is None or geom.is_empty:
+        return []
+
+    if isinstance(geom, Polygon):
+        if geom.exterior:
+            return [geom.exterior]
+        return []
+    elif isinstance(geom, MultiPolygon):
+        exteriors = []
+        for poly in geom.geoms:
+            if poly.exterior:
+                exteriors.append(poly.exterior)
+        return exteriors
+    else:
+        # Try to handle other geometry types gracefully
+        if hasattr(geom, 'exterior'):
+            return [geom.exterior]
+        return []
+
+
+def _is_polygon_like(geom) -> bool:
+    """Check if geometry is a Polygon or MultiPolygon."""
+    from shapely.geometry import Polygon, MultiPolygon
+    return isinstance(geom, (Polygon, MultiPolygon))
+
+
 # =============================================================================
 # Geometry Utility Functions
 # =============================================================================
@@ -245,57 +283,65 @@ def _angle_between_vectors(v1: Tuple[float, float], v2: Tuple[float, float]) -> 
 # =============================================================================
 
 def _sample_polygon_boundary(
-    polygon: Polygon,
+    polygon,
     unit_name: str,
     poly_index: int,
     sample_distance: float = 2.0
 ) -> List[BoundaryPoint]:
     """
     Sample points along a polygon boundary at regular intervals.
-    
+
     Args:
-        polygon: Shapely Polygon
+        polygon: Shapely Polygon or MultiPolygon
         unit_name: Name of the geological unit
         poly_index: Index of this polygon within the unit
         sample_distance: Distance between sample points in map units
-    
+
     Returns:
         List of BoundaryPoint objects
     """
+    from shapely.geometry import MultiPolygon
+
     points = []
-    
-    if polygon.is_empty or not polygon.exterior:
+
+    if polygon is None or polygon.is_empty:
         return points
-    
-    exterior = polygon.exterior
-    coords = list(exterior.coords)
-    n = len(coords)
-    
-    if n < 3:
+
+    # Get all exterior rings (handles both Polygon and MultiPolygon)
+    exterior_rings = _get_exterior_rings(polygon)
+
+    if not exterior_rings:
         return points
-    
-    for i in range(n - 1):  # -1 because last point duplicates first in closed ring
-        p1 = coords[i]
-        p2 = coords[i + 1]
-        
-        seg_len = _point_distance(p1, p2)
-        if seg_len < 0.001:
+
+    for exterior in exterior_rings:
+        coords = list(exterior.coords)
+        n = len(coords)
+
+        if n < 3:
             continue
-        
-        num_samples = max(1, int(math.ceil(seg_len / sample_distance)))
-        
-        for j in range(num_samples):
-            t = j / num_samples
-            x = p1[0] + (p2[0] - p1[0]) * t
-            y = p1[1] + (p2[1] - p1[1]) * t
-            
-            points.append(BoundaryPoint(
-                x=x,
-                y=y,
-                unit_name=unit_name,
-                poly_index=poly_index
-            ))
-    
+
+        for i in range(n - 1):  # -1 because last point duplicates first in closed ring
+            p1 = coords[i]
+            p2 = coords[i + 1]
+
+            seg_len = _point_distance(p1, p2)
+            if seg_len < 0.001:
+                continue
+
+            num_samples = max(1, int(math.ceil(seg_len / sample_distance)))
+
+            for j in range(num_samples):
+                t = j / num_samples
+                x = p1[0] + (p2[0] - p1[0]) * t
+                y = p1[1] + (p2[1] - p1[1]) * t
+
+                points.append(BoundaryPoint(
+                    x=x,
+                    y=y,
+                    unit_name=unit_name,
+                    poly_index=poly_index
+                ))
+
     return points
 
 
@@ -725,7 +771,60 @@ def _remove_backtracking(
     
     if removed_count > 0:
         logger.debug(f"Removed {removed_count} backtracking points")
-    
+
+    return result
+
+
+def _decluster_points(
+    polyline: List[Tuple[float, float]],
+    min_distance: float = 5.0
+) -> List[Tuple[float, float]]:
+    """
+    Merge points that are too close together into single averaged points.
+
+    This helps reduce artifacts from dense sampling where many points cluster
+    together. Points within min_distance of each other are merged by averaging
+    their positions.
+
+    Args:
+        polyline: List of (x, y) tuples
+        min_distance: Minimum distance between points (default 5m)
+
+    Returns:
+        Declustered polyline with merged points
+    """
+    if len(polyline) < 2:
+        return list(polyline)
+
+    result = []
+    cluster = [polyline[0]]
+
+    for i in range(1, len(polyline)):
+        current = polyline[i]
+        # Check distance from cluster centroid
+        centroid_x = sum(p[0] for p in cluster) / len(cluster)
+        centroid_y = sum(p[1] for p in cluster) / len(cluster)
+        dist = math.sqrt((current[0] - centroid_x)**2 + (current[1] - centroid_y)**2)
+
+        if dist < min_distance:
+            # Add to current cluster
+            cluster.append(current)
+        else:
+            # Save cluster centroid and start new cluster
+            result.append((centroid_x, centroid_y))
+            cluster = [current]
+
+    # Don't forget the last cluster
+    if cluster:
+        centroid_x = sum(p[0] for p in cluster) / len(cluster)
+        centroid_y = sum(p[1] for p in cluster) / len(cluster)
+        result.append((centroid_x, centroid_y))
+
+    original_count = len(polyline)
+    new_count = len(result)
+    if original_count != new_count:
+        logger.debug(f"Declustered {original_count} points to {new_count} points (min_distance={min_distance}m)")
+
     return result
 
 
@@ -816,7 +915,8 @@ def _clean_polyline(
     simplify_tolerance: float = 2.0,
     hook_reversal_angle: float = 140.0,  # More conservative - only remove clear reversals
     hook_max_length: float = 15.0,  # Shorter max hook length
-    backtrack_angle: float = 150.0  # More conservative backtrack detection
+    backtrack_angle: float = 150.0,  # More conservative backtrack detection
+    decluster_distance: float = 5.0  # Merge points closer than this
 ) -> List[Tuple[float, float]]:
     """
     Full polyline cleaning pipeline.
@@ -827,6 +927,7 @@ def _clean_polyline(
         hook_reversal_angle: Angle indicating direction reversal for hooks
         hook_max_length: Maximum length of a hook segment
         backtrack_angle: Angle threshold for backtracking detection
+        decluster_distance: Merge points within this distance
 
     Returns:
         Cleaned and simplified polyline
@@ -836,19 +937,24 @@ def _clean_polyline(
 
     logger.debug(f"Cleaning polyline with {len(polyline)} points")
 
-    # Step 1: Simplify first to reduce noise (but preserve shape)
-    if simplify_tolerance > 0 and len(polyline) > 10:
-        result = _simplify_polyline_douglas_peucker(polyline, simplify_tolerance)
-        logger.debug(f"  After simplification: {len(result)} points")
+    # Step 1: Decluster first to merge very close points
+    if decluster_distance > 0:
+        result = _decluster_points(polyline, decluster_distance)
+        logger.debug(f"  After declustering: {len(result)} points")
     else:
         result = list(polyline)
 
-    # Step 2: Remove only very clear hooks from simplified data
+    # Step 2: Simplify to reduce noise (but preserve shape)
+    if simplify_tolerance > 0 and len(result) > 10:
+        result = _simplify_polyline_douglas_peucker(result, simplify_tolerance)
+        logger.debug(f"  After simplification: {len(result)} points")
+
+    # Step 3: Remove only very clear hooks from simplified data
     # (this is more conservative because we check against overall trend)
     result = _detect_and_trim_hooks(result, hook_reversal_angle, hook_max_length, min_points_remaining=4)
     logger.debug(f"  After hook detection: {len(result)} points")
 
-    # Step 3: Remove obvious backtracking (very conservative threshold)
+    # Step 4: Remove obvious backtracking (very conservative threshold)
     result = _remove_backtracking(result, backtrack_angle)
     logger.debug(f"  After backtrack removal: {len(result)} points")
 
@@ -1294,16 +1400,36 @@ class ContactExtractor:
                 if poly1.distance(poly2) > self.proximity_threshold:
                     continue
                 
-                # Extract contact points
-                points = extract_contact_points(
-                    boundary1=poly1.exterior,
-                    boundary2=poly2.exterior,
-                    fault_lines=fault_geometries if fault_geometries else None,
-                    proximity_threshold=self.proximity_threshold,
-                    sample_distance=self.sample_distance,
-                    fault_exclusion_distance=self.fault_exclusion_distance
-                )
-                
+                # Get exterior rings (handles both Polygon and MultiPolygon)
+                exteriors1 = _get_exterior_rings(poly1)
+                exteriors2 = _get_exterior_rings(poly2)
+
+                if not exteriors1 or not exteriors2:
+                    continue
+
+                # Extract contact points from all combinations of exterior rings
+                all_points = []
+                for ext1 in exteriors1:
+                    for ext2 in exteriors2:
+                        pts = extract_contact_points(
+                            boundary1=ext1,
+                            boundary2=ext2,
+                            fault_lines=fault_geometries if fault_geometries else None,
+                            proximity_threshold=self.proximity_threshold,
+                            sample_distance=self.sample_distance,
+                            fault_exclusion_distance=self.fault_exclusion_distance
+                        )
+                        all_points.extend(pts)
+
+                # Remove duplicates and clean
+                if all_points:
+                    all_points = _remove_duplicate_points(all_points, tolerance=self.sample_distance / 3)
+                    if len(all_points) > 2:
+                        all_points = _sort_points_nearest_neighbor(all_points, max_gap=50.0)
+                        all_points = _clean_polyline(all_points, simplify_tolerance=self.simplify_tolerance)
+
+                points = all_points
+
                 if len(points) < 2:
                     continue
 
@@ -1524,8 +1650,8 @@ def extract_contacts_grouped(
 
 
 def extract_single_contact(
-    poly1: Polygon,
-    poly2: Polygon,
+    poly1,
+    poly2,
     name1: str,
     name2: str,
     form1: str,
@@ -1537,21 +1663,43 @@ def extract_single_contact(
 ) -> Optional[Dict]:
     """
     Extract a single contact between two polygons.
-    
+
     Convenience function for section_viewer and other modules.
-    
+    Handles both Polygon and MultiPolygon geometries.
+
     Returns:
         Contact dictionary or None if no contact found
     """
     try:
-        points = extract_contact_points(
-            boundary1=poly1.exterior,
-            boundary2=poly2.exterior,
-            fault_lines=fault_lines,
-            proximity_threshold=buffer_distance,
-            sample_distance=2.0,
-            fault_exclusion_distance=15.0
-        )
+        # Get exterior rings (handles both Polygon and MultiPolygon)
+        exteriors1 = _get_exterior_rings(poly1)
+        exteriors2 = _get_exterior_rings(poly2)
+
+        if not exteriors1 or not exteriors2:
+            return None
+
+        # Extract contact points from all combinations of exterior rings
+        all_points = []
+        for ext1 in exteriors1:
+            for ext2 in exteriors2:
+                pts = extract_contact_points(
+                    boundary1=ext1,
+                    boundary2=ext2,
+                    fault_lines=fault_lines,
+                    proximity_threshold=buffer_distance,
+                    sample_distance=2.0,
+                    fault_exclusion_distance=15.0
+                )
+                all_points.extend(pts)
+
+        # Remove duplicates and clean
+        if all_points:
+            all_points = _remove_duplicate_points(all_points, tolerance=2.0 / 3)
+            if len(all_points) > 2:
+                all_points = _sort_points_nearest_neighbor(all_points, max_gap=50.0)
+                all_points = _clean_polyline(all_points, simplify_tolerance=simplify_tolerance)
+
+        points = all_points
 
         if len(points) < 2:
             return None
