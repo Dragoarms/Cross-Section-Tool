@@ -895,7 +895,7 @@ def _remove_duplicate_points(
     """Remove points that are within tolerance of each other."""
     if not points:
         return []
-    
+
     result = [points[0]]
     for pt in points[1:]:
         is_dup = False
@@ -906,7 +906,136 @@ def _remove_duplicate_points(
                 break
         if not is_dup:
             result.append(pt)
-    
+
+    return result
+
+
+def _simplify_to_target_count(
+    polyline: List[Tuple[float, float]],
+    target_count: int = 20,
+    min_tolerance: float = 1.0,
+    max_tolerance: float = 50.0
+) -> List[Tuple[float, float]]:
+    """
+    Simplify polyline to approximately target number of points.
+
+    Uses binary search to find the right Douglas-Peucker tolerance
+    that achieves the target count while preserving shape.
+
+    Args:
+        polyline: List of (x, y) coordinates
+        target_count: Target number of points (approximate)
+        min_tolerance: Minimum simplification tolerance
+        max_tolerance: Maximum simplification tolerance
+
+    Returns:
+        Simplified polyline with approximately target_count points
+    """
+    if len(polyline) <= target_count:
+        return polyline
+
+    # Binary search for the right tolerance
+    low = min_tolerance
+    high = max_tolerance
+
+    best_result = polyline
+    best_diff = abs(len(polyline) - target_count)
+
+    for _ in range(15):  # Max 15 iterations
+        mid = (low + high) / 2
+        result = _simplify_polyline_douglas_peucker(polyline, mid)
+
+        diff = abs(len(result) - target_count)
+        if diff < best_diff:
+            best_diff = diff
+            best_result = result
+
+        if len(result) > target_count:
+            low = mid  # Need more aggressive simplification
+        elif len(result) < target_count:
+            high = mid  # Need less aggressive simplification
+        else:
+            break  # Exact match
+
+        if high - low < 0.1:
+            break
+
+    logger.debug(f"Simplified to target: {len(polyline)} -> {len(best_result)} points (target={target_count})")
+    return best_result
+
+
+def _adaptive_simplify(
+    polyline: List[Tuple[float, float]],
+    base_tolerance: float = 2.0,
+    curvature_factor: float = 0.5,
+    min_segment_length: float = 5.0
+) -> List[Tuple[float, float]]:
+    """
+    Adaptively simplify polyline, preserving curved sections better.
+
+    Uses local curvature to determine simplification - straight sections
+    are simplified more aggressively, curved sections are preserved.
+
+    Args:
+        polyline: List of (x, y) coordinates
+        base_tolerance: Base Douglas-Peucker tolerance
+        curvature_factor: How much curvature reduces tolerance (0-1)
+        min_segment_length: Minimum distance between output points
+
+    Returns:
+        Adaptively simplified polyline
+    """
+    if len(polyline) < 5:
+        return polyline
+
+    # Calculate local curvature at each point
+    curvatures = [0.0]  # First point has no curvature
+    for i in range(1, len(polyline) - 1):
+        # Use angle between incoming and outgoing vectors
+        v1 = _vector_subtract(polyline[i], polyline[i-1])
+        v2 = _vector_subtract(polyline[i+1], polyline[i])
+        angle = _angle_between_vectors(v1, v2)
+        # Normalize to 0-1 (180 degrees = max curvature)
+        curvatures.append(angle / 180.0)
+    curvatures.append(0.0)  # Last point
+
+    # Build result by keeping points based on curvature and spacing
+    result = [polyline[0]]
+
+    for i in range(1, len(polyline) - 1):
+        # Calculate local tolerance based on curvature
+        local_curvature = curvatures[i]
+        # Higher curvature = lower tolerance = more points preserved
+        local_tolerance = base_tolerance * (1.0 - curvature_factor * local_curvature)
+
+        # Check distance from last kept point
+        dist_from_last = _point_distance(polyline[i], result[-1])
+
+        # Check perpendicular distance to line from last kept to next point
+        perp_dist = 0.0
+        if i < len(polyline) - 1:
+            # Find next significant point
+            next_idx = min(i + 5, len(polyline) - 1)
+            dx = polyline[next_idx][0] - result[-1][0]
+            dy = polyline[next_idx][1] - result[-1][1]
+            line_len = math.sqrt(dx*dx + dy*dy)
+            if line_len > 0.001:
+                cross = abs((polyline[i][0] - result[-1][0]) * dy -
+                           (polyline[i][1] - result[-1][1]) * dx)
+                perp_dist = cross / line_len
+
+        # Keep point if:
+        # 1. It's far enough from last point, OR
+        # 2. Perpendicular distance exceeds local tolerance (shape significance), OR
+        # 3. High curvature point
+        if (dist_from_last >= min_segment_length or
+            perp_dist > local_tolerance or
+            local_curvature > 0.3):
+            result.append(polyline[i])
+
+    result.append(polyline[-1])
+
+    logger.debug(f"Adaptive simplify: {len(polyline)} -> {len(result)} points")
     return result
 
 
@@ -916,7 +1045,9 @@ def _clean_polyline(
     hook_reversal_angle: float = 140.0,  # More conservative - only remove clear reversals
     hook_max_length: float = 15.0,  # Shorter max hook length
     backtrack_angle: float = 150.0,  # More conservative backtrack detection
-    decluster_distance: float = 5.0  # Merge points closer than this
+    decluster_distance: float = 5.0,  # Merge points closer than this
+    target_node_count: int = 0,  # If > 0, simplify to approximately this many nodes
+    use_adaptive: bool = True  # Use adaptive simplification
 ) -> List[Tuple[float, float]]:
     """
     Full polyline cleaning pipeline.
@@ -928,6 +1059,8 @@ def _clean_polyline(
         hook_max_length: Maximum length of a hook segment
         backtrack_angle: Angle threshold for backtracking detection
         decluster_distance: Merge points within this distance
+        target_node_count: If > 0, simplify to approximately this many nodes
+        use_adaptive: Use adaptive simplification (preserves curves better)
 
     Returns:
         Cleaned and simplified polyline
@@ -945,9 +1078,19 @@ def _clean_polyline(
         result = list(polyline)
 
     # Step 2: Simplify to reduce noise (but preserve shape)
-    if simplify_tolerance > 0 and len(result) > 10:
-        result = _simplify_polyline_douglas_peucker(result, simplify_tolerance)
-        logger.debug(f"  After simplification: {len(result)} points")
+    if len(result) > 10:
+        if target_node_count > 0:
+            # Simplify to target count
+            result = _simplify_to_target_count(result, target_node_count)
+            logger.debug(f"  After target simplification: {len(result)} points")
+        elif use_adaptive and simplify_tolerance > 0:
+            # Adaptive simplification preserves curves better
+            result = _adaptive_simplify(result, simplify_tolerance)
+            logger.debug(f"  After adaptive simplification: {len(result)} points")
+        elif simplify_tolerance > 0:
+            # Standard Douglas-Peucker
+            result = _simplify_polyline_douglas_peucker(result, simplify_tolerance)
+            logger.debug(f"  After D-P simplification: {len(result)} points")
 
     # Step 3: Remove only very clear hooks from simplified data
     # (this is more conservative because we check against overall trend)
