@@ -3527,6 +3527,8 @@ class GeologicalCrossSectionGUI:
         """Create triangulated mesh between two sections using proper lofting.
 
         This improved version:
+        - Detects and handles multiple disconnected polygon parts
+        - Matches corresponding parts between sections by centroid proximity
         - Aligns polygon starting points to prevent vertex crossing/twisting
         - Uses feature-based alignment (top points, centroids)
         - Resamples both outlines by arc length for proper correspondence
@@ -3544,67 +3546,84 @@ class GeologicalCrossSectionGUI:
             if len(coords1) < 3 or len(coords2) < 3:
                 return
 
-            # Prepare coordinates and align starting points
-            aligned1, aligned2, n_points = self._prepare_loft_profiles(coords1, coords2)
+            # Split into separate polygon parts if there are discontinuities
+            parts1 = self._split_disconnected_polygons(coords1)
+            parts2 = self._split_disconnected_polygons(coords2)
 
-            if aligned1 is None or aligned2 is None:
-                return
+            # Match corresponding parts between sections
+            matched_parts = self._match_polygon_parts(parts1, parts2)
 
-            # Build vertices for both sections
-            base_index = len(self.mesh_vertices)
+            if not matched_parts:
+                # Fallback: if no matches found, try treating as single polygons
+                matched_parts = [(coords1, coords2)]
 
-            verts = []
-            for i in range(n_points):
-                verts.append([aligned1[i, 0], northing1, aligned1[i, 1]])
-            for i in range(n_points):
-                verts.append([aligned2[i, 0], northing2, aligned2[i, 1]])
-
-            verts = np.asarray(verts)
-
-            # Append to global mesh vertex list
-            for v in verts:
-                self.mesh_vertices.append(v.tolist())
-
-            # Build faces as a simple strip between the two resampled outlines
-            faces = []
-            for i in range(n_points - 1):
-                # Two triangles per quad: (i, i+1, i+n) and (i+1, i+n+1, i+n)
-                i0 = base_index + i
-                i1 = base_index + i + 1
-                j0 = base_index + i + n_points
-                j1 = base_index + i + n_points + 1
-
-                faces.append([i0, i1, j0])
-                faces.append([i1, j1, j0])
-
-            # Close the strip: connect last vertex back to first
-            i0 = base_index + n_points - 1  # Last vertex of section 1
-            i1 = base_index + 0              # First vertex of section 1
-            j0 = base_index + n_points - 1 + n_points  # Last vertex of section 2
-            j1 = base_index + n_points       # First vertex of section 2
-
-            faces.append([i0, i1, j0])
-            faces.append([i1, j1, j0])
-
-            # Append to global mesh face list
-            self.mesh_faces.extend(faces)
-
-            # Plot triangulated surface for visual feedback
-            self.ax_3d.plot_trisurf(
-                verts[:, 0],
-                verts[:, 1],
-                verts[:, 2],
-                triangles=np.array([[f[0] - base_index, f[1] - base_index, f[2] - base_index] for f in faces]),
-                color=color,
-                alpha=alpha,
-                edgecolor="none",
-                shade=True,
-            )
+            # Loft each matched pair of parts
+            for part1, part2 in matched_parts:
+                self._loft_single_part(part1, part2, northing1, northing2, color, alpha)
 
         except Exception as e:
             logger.error(f"Error creating mesh: {e}")
             # Fallback - use simple connection if something fails
             self.connect_sections_simple(section1, section2, alpha)
+
+    def _loft_single_part(self, coords1, coords2, northing1, northing2, color, alpha=0.7):
+        """Loft a single polygon part between two sections."""
+        # Prepare coordinates and align starting points
+        aligned1, aligned2, n_points = self._prepare_loft_profiles(coords1, coords2)
+
+        if aligned1 is None or aligned2 is None:
+            return
+
+        # Build vertices for both sections
+        base_index = len(self.mesh_vertices)
+
+        verts = []
+        for i in range(n_points):
+            verts.append([aligned1[i, 0], northing1, aligned1[i, 1]])
+        for i in range(n_points):
+            verts.append([aligned2[i, 0], northing2, aligned2[i, 1]])
+
+        verts = np.asarray(verts)
+
+        # Append to global mesh vertex list
+        for v in verts:
+            self.mesh_vertices.append(v.tolist())
+
+        # Build faces as a simple strip between the two resampled outlines
+        faces = []
+        for i in range(n_points - 1):
+            # Two triangles per quad: (i, i+1, i+n) and (i+1, i+n+1, i+n)
+            i0 = base_index + i
+            i1 = base_index + i + 1
+            j0 = base_index + i + n_points
+            j1 = base_index + i + n_points + 1
+
+            faces.append([i0, i1, j0])
+            faces.append([i1, j1, j0])
+
+        # Close the strip: connect last vertex back to first
+        i0 = base_index + n_points - 1  # Last vertex of section 1
+        i1 = base_index + 0              # First vertex of section 1
+        j0 = base_index + n_points - 1 + n_points  # Last vertex of section 2
+        j1 = base_index + n_points       # First vertex of section 2
+
+        faces.append([i0, i1, j0])
+        faces.append([i1, j1, j0])
+
+        # Append to global mesh face list
+        self.mesh_faces.extend(faces)
+
+        # Plot triangulated surface for visual feedback
+        self.ax_3d.plot_trisurf(
+            verts[:, 0],
+            verts[:, 1],
+            verts[:, 2],
+            triangles=np.array([[f[0] - base_index, f[1] - base_index, f[2] - base_index] for f in faces]),
+            color=color,
+            alpha=alpha,
+            edgecolor="none",
+            shade=True,
+        )
 
     def _prepare_loft_profiles(self, coords1, coords2, n_samples=64):
         """Prepare two polygon profiles for lofting with proper alignment.
@@ -3715,6 +3734,100 @@ class GeologicalCrossSectionGUI:
         aligned = np.roll(target, -best_offset, axis=0)
 
         return aligned
+
+    def _split_disconnected_polygons(self, coords, gap_factor=3.0):
+        """Split a coordinate array into separate polygons if there are large gaps.
+
+        Detects discontinuities where segment length exceeds gap_factor times
+        the median segment length, indicating separate polygon parts.
+
+        Returns a list of coordinate arrays, one per connected polygon part.
+        """
+        coords = np.asarray(coords)
+        if len(coords) < 3:
+            return [coords]
+
+        # Calculate segment lengths
+        # For a potentially multi-part polygon, we check distances between consecutive points
+        deltas = np.diff(coords, axis=0)
+        seg_lengths = np.sqrt(deltas[:, 0]**2 + deltas[:, 1]**2)
+
+        if len(seg_lengths) == 0:
+            return [coords]
+
+        # Find median segment length (typical edge length)
+        median_len = np.median(seg_lengths)
+        if median_len < 1e-10:
+            return [coords]
+
+        # Find gaps: segments much longer than typical
+        threshold = gap_factor * median_len
+        gap_indices = np.where(seg_lengths > threshold)[0]
+
+        if len(gap_indices) == 0:
+            # No gaps - single polygon
+            return [coords]
+
+        # Split at gap indices
+        parts = []
+        start_idx = 0
+
+        for gap_idx in gap_indices:
+            # Extract part from start_idx to gap_idx (inclusive)
+            part = coords[start_idx:gap_idx + 1]
+            if len(part) >= 3:
+                parts.append(part)
+            start_idx = gap_idx + 1
+
+        # Don't forget the last part
+        if start_idx < len(coords):
+            part = coords[start_idx:]
+            if len(part) >= 3:
+                parts.append(part)
+
+        return parts if parts else [coords]
+
+    def _match_polygon_parts(self, parts1, parts2):
+        """Match polygon parts between two sections by centroid proximity.
+
+        Returns list of (part1, part2) tuples for parts that should be lofted together.
+        Unmatched parts are not included.
+        """
+        if not parts1 or not parts2:
+            return []
+
+        # Calculate centroids for all parts
+        centroids1 = [np.mean(p, axis=0) for p in parts1]
+        centroids2 = [np.mean(p, axis=0) for p in parts2]
+
+        matches = []
+        used2 = set()
+
+        # For each part in section 1, find closest unmatched part in section 2
+        for i, c1 in enumerate(centroids1):
+            best_j = None
+            best_dist = float('inf')
+
+            for j, c2 in enumerate(centroids2):
+                if j in used2:
+                    continue
+                dist = np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+
+            if best_j is not None:
+                # Check if the match is reasonable (not too far apart)
+                size1 = max(np.ptp(parts1[i][:, 0]), np.ptp(parts1[i][:, 1]))
+                size2 = max(np.ptp(parts2[best_j][:, 0]), np.ptp(parts2[best_j][:, 1]))
+                max_size = max(size1, size2, 1.0)
+
+                # Only match if centroids are within 2x the typical size
+                if best_dist < 2.0 * max_size:
+                    matches.append((parts1[i], parts2[best_j]))
+                    used2.add(best_j)
+
+        return matches
 
 
     def connect_sections_simple(self, section1, section2, alpha=0.7):
