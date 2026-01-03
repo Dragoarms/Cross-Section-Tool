@@ -3242,16 +3242,26 @@ class GeologicalCrossSectionGUI:
                         zorder = 15  # On top of everything
                         line_alpha = 1.0
                     elif fault_assignment or is_fault:
-                        if fault_assignment and fault_assignment in self.defined_faults:
+                        # Determine if this fault is actually assigned to a defined fault
+                        is_assigned_to_fault = fault_assignment and fault_assignment in self.defined_faults
+
+                        if is_assigned_to_fault:
                             base_color = self.defined_faults[fault_assignment].get('color', 'red')
                         else:
                             base_color = polyline.get("color", "red") if is_fault else "red"
 
                         if mode == 'fault':
-                            # In fault mode - show faults with their colors but muted
-                            color = base_color
-                            linewidth = 2.5
-                            line_alpha = 0.6
+                            # In fault mode - only mute UNASSIGNED faults
+                            if is_assigned_to_fault:
+                                # Assigned fault - show at full opacity with its color
+                                color = base_color
+                                linewidth = 3.5
+                                line_alpha = 1.0
+                            else:
+                                # Unassigned fault - muted so user can see what needs work
+                                color = base_color
+                                linewidth = 2.5
+                                line_alpha = 0.5
                         else:
                             color = base_color
                             linewidth = 3.5
@@ -10643,37 +10653,24 @@ class GeologicalCrossSectionGUI:
         logger.info(f"Moved fault '{fault_name}' down")
 
     def select_unit_for_assignment(self, unit_name: str):
-        """Select a unit for assignment. If features are selected, assign them all."""
+        """Select a unit for assignment. Click on items to assign them one by one.
+
+        For bulk assignment of selected items, use the dropdown+Go button instead.
+        """
         if self.classification_mode != "polygon":
             self.mode_var.set("polygon")
             self.on_classification_mode_changed()
-        
+
         self.current_unit_assignment = unit_name
         self.current_fault_assignment = None
-        
+
         for name, btn in self.unit_buttons.items():
             btn.config(relief=tk.SUNKEN if name == unit_name else tk.RAISED, bd=4 if name == unit_name else 2)
         for btn in self.fault_buttons.values():
             btn.config(relief=tk.RAISED, bd=2)
-        
-        self.assignment_label.config(text=f"Assigning to: {unit_name}")
+
+        self.assignment_label.config(text=f"Click items to assign to: {unit_name}")
         logger.info(f"Selected unit for assignment: {unit_name}")
-
-        # If features are selected (from "Select Similar" or multi-select), assign them all
-        if self.selected_units:
-            assigned_count = 0
-            for feature_name in list(self.selected_units):
-                # Check if it's a polygon
-                if feature_name in self.all_geological_units:
-                    self._assign_polygon_to_unit(feature_name, unit_name)
-                    assigned_count += 1
-
-            if assigned_count > 0:
-                self.status_var.set(f"Assigned {assigned_count} features to {unit_name}")
-                logger.info(f"Bulk assigned {assigned_count} features to {unit_name}")
-                self.selected_units.clear()  # Clear selection after bulk assign
-                self.update_selection_display()
-                self.update_section_display()
 
     def clear_polygon_assignment(self, polygon_name: str):
         """Clear the assignment from a polygon (reset to UNKNOWN)."""
@@ -10734,20 +10731,23 @@ class GeologicalCrossSectionGUI:
         logger.info(f"Unassigned {unassigned_count} features")
     
     def select_fault_for_assignment(self, fault_name: str):
-        """Select a fault for assignment."""
+        """Select a fault for assignment. Click on items to assign them one by one.
+
+        For bulk assignment of selected items, use the dropdown+Go button instead.
+        """
         if self.classification_mode != "fault":
             self.mode_var.set("fault")
             self.on_classification_mode_changed()
-        
+
         self.current_fault_assignment = fault_name
         self.current_unit_assignment = None
-        
+
         for name, btn in self.fault_buttons.items():
             btn.config(relief=tk.SUNKEN if name == fault_name else tk.RAISED, bd=4 if name == fault_name else 2)
         for btn in self.unit_buttons.values():
             btn.config(relief=tk.RAISED, bd=2)
-        
-        self.assignment_label.config(text=f"Assigning to: {fault_name}")
+
+        self.assignment_label.config(text=f"Click lines to assign to: {fault_name}")
         logger.info(f"Selected fault for assignment: {fault_name}")
 
     def add_new_unit(self):
