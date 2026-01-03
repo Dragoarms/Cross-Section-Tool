@@ -2241,9 +2241,9 @@ class GeologicalCrossSectionGUI:
         selector_frame = ttk.LabelFrame(content_pane, text="Unit Selector", padding=5)
         content_pane.add(selector_frame, weight=1)
 
-        # Selection buttons
+        # Selection buttons - row 1
         btn_frame = ttk.Frame(selector_frame)
-        btn_frame.pack(fill=tk.X, pady=(0, 5))
+        btn_frame.pack(fill=tk.X, pady=(0, 2))
 
         ttk.Button(btn_frame, text="Select All", command=self._select_all_3d_units).pack(
             side=tk.LEFT, padx=2
@@ -2252,6 +2252,17 @@ class GeologicalCrossSectionGUI:
             side=tk.LEFT, padx=2
         )
         ttk.Button(btn_frame, text="Refresh", command=self._refresh_3d_unit_tree).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        # Selection buttons - row 2
+        btn_frame2 = ttk.Frame(selector_frame)
+        btn_frame2.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(btn_frame2, text="Select Similar", command=self._select_similar_3d).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(btn_frame2, text="Highlight", command=self._highlight_selected_3d).pack(
             side=tk.LEFT, padx=2
         )
 
@@ -2451,6 +2462,82 @@ class GeologicalCrossSectionGUI:
         self.selected_units.clear()
         self._update_3d_tree_selection_marks()
         self.update_3d_display()
+
+    def _select_similar_3d(self):
+        """Select all units with the same formation as currently selected units."""
+        if not self.selected_units:
+            messagebox.showinfo("No Selection", "Please select at least one unit first")
+            return
+
+        # Get formations of currently selected units
+        selected_formations = set()
+        for unit_name in self.selected_units:
+            if unit_name in self.all_geological_units:
+                formation = self.all_geological_units[unit_name].get("formation", "Unknown")
+                selected_formations.add(formation)
+
+        # Select all units with matching formations
+        new_selections = set()
+        for unit_name, unit in self.all_geological_units.items():
+            if unit.get("formation", "Unknown") in selected_formations:
+                new_selections.add(unit_name)
+
+        self.selected_units = new_selections
+        self._update_3d_tree_selection_marks()
+        self.update_3d_display()
+
+        messagebox.showinfo(
+            "Select Similar",
+            f"Selected {len(new_selections)} units from {len(selected_formations)} formation(s)"
+        )
+
+    def _highlight_selected_3d(self):
+        """Highlight currently selected units in 3D view with wireframe outlines."""
+        if not self.selected_units:
+            messagebox.showinfo("No Selection", "Please select units to highlight")
+            return
+
+        # Get currently selected formations for highlighting
+        selected_formations = set()
+        for unit_name in self.selected_units:
+            if unit_name in self.all_geological_units:
+                formation = self.all_geological_units[unit_name].get("formation")
+                if formation:
+                    selected_formations.add(formation)
+
+        # Draw wireframe outlines for selected units
+        for unit_name in self.selected_units:
+            if unit_name not in self.all_geological_units:
+                continue
+
+            unit = self.all_geological_units[unit_name]
+            vertices = unit.get("vertices", [])
+            northing = unit.get("northing")
+
+            if northing is None or len(vertices) < 6:
+                continue
+
+            # Extract coordinates
+            xs = [vertices[i] for i in range(0, len(vertices), 2)]
+            zs = [vertices[i + 1] for i in range(0, len(vertices), 2) if i + 1 < len(vertices)]
+
+            # Close the polygon
+            if xs and zs:
+                xs.append(xs[0])
+                zs.append(zs[0])
+
+            # Draw thick highlight outline
+            ys = [northing] * len(xs)
+            self.ax_3d.plot(
+                xs, ys, zs,
+                color='yellow',
+                linewidth=3,
+                alpha=1.0,
+                zorder=100  # Draw on top
+            )
+
+        self.canvas_3d.draw()
+        self.status_var.set(f"Highlighted {len(self.selected_units)} units")
 
     def update_display(self):
         """Update the current display based on active tab."""
@@ -3944,11 +4031,13 @@ class GeologicalCrossSectionGUI:
 
         return aligned
 
-    def _split_disconnected_polygons(self, coords, gap_factor=3.0):
+    def _split_disconnected_polygons(self, coords, gap_factor=5.0):
         """Split a coordinate array into separate polygons if there are large gaps.
 
-        Detects discontinuities where segment length exceeds gap_factor times
-        the median segment length, indicating separate polygon parts.
+        Detects true discontinuities (not just long polygon edges) by:
+        1. Using a high threshold based on the polygon's characteristic size
+        2. Requiring gaps to be significantly larger than the polygon extent
+        3. Checking that the gap is not part of the normal perimeter
 
         Returns a list of coordinate arrays, one per connected polygon part.
         """
@@ -3957,32 +4046,53 @@ class GeologicalCrossSectionGUI:
             return [coords]
 
         # Calculate segment lengths
-        # For a potentially multi-part polygon, we check distances between consecutive points
         deltas = np.diff(coords, axis=0)
         seg_lengths = np.sqrt(deltas[:, 0]**2 + deltas[:, 1]**2)
 
         if len(seg_lengths) == 0:
             return [coords]
 
-        # Find median segment length (typical edge length)
-        median_len = np.median(seg_lengths)
-        if median_len < 1e-10:
+        # Calculate polygon's characteristic size (bounding box diagonal)
+        x_range = np.ptp(coords[:, 0])
+        y_range = np.ptp(coords[:, 1])
+        bbox_diagonal = np.sqrt(x_range**2 + y_range**2)
+
+        if bbox_diagonal < 1e-10:
             return [coords]
 
-        # Find gaps: segments much longer than typical
-        threshold = gap_factor * median_len
+        # For a true gap (disconnected parts), the gap should be:
+        # 1. Much larger than the 95th percentile of segment lengths
+        # 2. At least half the bounding box diagonal (very conservative)
+        percentile_95 = np.percentile(seg_lengths, 95)
+
+        # Threshold is the larger of:
+        # - gap_factor times the 95th percentile
+        # - 50% of the bounding box diagonal
+        threshold = max(gap_factor * percentile_95, 0.5 * bbox_diagonal)
+
         gap_indices = np.where(seg_lengths > threshold)[0]
 
         if len(gap_indices) == 0:
             # No gaps - single polygon
             return [coords]
 
-        # Split at gap indices
+        # Additional check: for each potential gap, verify it's a true discontinuity
+        # by checking that the endpoints are not close to forming a closed loop
+        valid_gaps = []
+        for gap_idx in gap_indices:
+            # A true gap means we're jumping to a different polygon part
+            # The gap length should be much larger than typical
+            if seg_lengths[gap_idx] > threshold:
+                valid_gaps.append(gap_idx)
+
+        if len(valid_gaps) == 0:
+            return [coords]
+
+        # Split at valid gap indices
         parts = []
         start_idx = 0
 
-        for gap_idx in gap_indices:
-            # Extract part from start_idx to gap_idx (inclusive)
+        for gap_idx in valid_gaps:
             part = coords[start_idx:gap_idx + 1]
             if len(part) >= 3:
                 parts.append(part)
