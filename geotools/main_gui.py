@@ -233,7 +233,7 @@ class GeologicalCrossSectionGUI:
 
         # Model boundaries for each section
         self.model_boundaries = {}  # {northing: ModelBoundary}
-        self.show_boundaries_var = tk.BooleanVar(value=True)  # Show model boundary lines
+        self.show_boundaries_var = tk.BooleanVar(value=False)  # Disabled - boundaries expand view too much
 
         # Pan/drag state
         self.pan_active = False
@@ -2751,21 +2751,10 @@ class GeologicalCrossSectionGUI:
 
                     # Extract model boundary using coord_system bounds (more accurate than path detection)
                     if transform and coord_system:
-                        try:
-                            section_northing_val = coord_system.get("northing", 0.0)
-                            transform_func = lambda x, y: (transform(x, y)[0], transform(x, y)[2])  # (easting, rl)
-                            model_boundary = create_model_boundary_from_coord_system(
-                                coord_system=coord_system,
-                                page=page,
-                                transform_func=transform_func,
-                                northing=section_northing_val,
-                                section_key=(pdf_path, page_num)
-                            )
-                            if model_boundary:
-                                self.model_boundaries[section_northing_val] = model_boundary
-                                logger.debug(f"Extracted model boundary for section N={section_northing_val}")
-                        except Exception as e:
-                            logger.debug(f"Could not extract model boundary: {e}")
+                        # Model boundary extraction disabled - was expanding view extents unnecessarily
+                        # The coordinate system easting/rl bounds are much larger than actual content
+                        # and cause the view to zoom out too far
+                        pass
 
                     # Process units
                     page_units = {}
@@ -2942,31 +2931,17 @@ class GeologicalCrossSectionGUI:
 
     # Part 6: Section Viewer Methods
     def calculate_global_ranges(self):
-        """Calculate the global min/max for eastings and RLs across all sections."""
-        self.global_easting_min = float("inf")
-        self.global_easting_max = float("-inf")
-        self.global_rl_min = float("inf")
-        self.global_rl_max = float("-inf")
+        """Calculate the global min/max for eastings and RLs across all sections.
 
+        Uses ONLY actual feature bounds (units + polylines), NOT coord_system bounds
+        which are much larger and cause the view to zoom out too far.
+        """
         self.content_easting_min = float("inf")
         self.content_easting_max = float("-inf")
         self.content_rl_min = float("inf")
         self.content_rl_max = float("-inf")
 
         for (pdf, page), section_data in self.all_sections_data.items():
-            easting_min = section_data.get("easting_min")
-            easting_max = section_data.get("easting_max")
-            rl_min = section_data.get("rl_min")
-            rl_max = section_data.get("rl_max")
-
-            if easting_min is not None and easting_max is not None:
-                self.global_easting_min = min(self.global_easting_min, easting_min)
-                self.global_easting_max = max(self.global_easting_max, easting_max)
-
-            if rl_min is not None and rl_max is not None:
-                self.global_rl_min = min(self.global_rl_min, rl_min)
-                self.global_rl_max = max(self.global_rl_max, rl_max)
-
             # Check actual unit vertices
             for unit_name, unit in section_data.get("units", {}).items():
                 vertices = unit.get("vertices", [])
@@ -2980,12 +2955,33 @@ class GeologicalCrossSectionGUI:
                             self.content_rl_min = min(self.content_rl_min, rl)
                             self.content_rl_max = max(self.content_rl_max, rl)
 
-        # Add margins
-        if self.global_easting_min != float("inf"):
-            self.global_easting_min -= 100
-            self.global_easting_max += 100
-            self.global_rl_min -= 50
-            self.global_rl_max += 50
+            # Also check polyline vertices (faults, contacts)
+            for poly_name, polyline in section_data.get("polylines", {}).items():
+                vertices = polyline.get("vertices", [])
+                for j in range(0, len(vertices), 2):
+                    if j + 1 < len(vertices):
+                        easting = vertices[j]
+                        rl = vertices[j + 1]
+                        if easting > 10000:  # Real-world coordinates
+                            self.content_easting_min = min(self.content_easting_min, easting)
+                            self.content_easting_max = max(self.content_easting_max, easting)
+                            self.content_rl_min = min(self.content_rl_min, rl)
+                            self.content_rl_max = max(self.content_rl_max, rl)
+
+        # Set global ranges to content ranges (no longer using coord_system bounds)
+        self.global_easting_min = self.content_easting_min
+        self.global_easting_max = self.content_easting_max
+        self.global_rl_min = self.content_rl_min
+        self.global_rl_max = self.content_rl_max
+
+        # Add margins to content bounds
+        if self.content_easting_min != float("inf"):
+            margin_e = (self.content_easting_max - self.content_easting_min) * 0.05
+            margin_rl = (self.content_rl_max - self.content_rl_min) * 0.05
+            self.global_easting_min -= max(margin_e, 50)
+            self.global_easting_max += max(margin_e, 50)
+            self.global_rl_min -= max(margin_rl, 25)
+            self.global_rl_max += max(margin_rl, 25)
 
         # Update northings list
         self.northings = sorted(
@@ -3232,15 +3228,36 @@ class GeologicalCrossSectionGUI:
                     is_fault = polyline.get("is_fault", False) or polyline.get("type") == "Fault"
                     is_line_assigned = polyline.get("is_assigned", True)  # Default True for backward compat
 
-                    if fault_assignment or is_fault:
-                        if fault_assignment and fault_assignment in self.defined_faults:
-                            color = self.defined_faults[fault_assignment].get('color', 'red')
-                        else:
-                            color = polyline.get("color", "red") if is_fault else "red"
-                        linewidth = 3.5  # Thicker for visibility
+                    # Check if this polyline is selected
+                    is_selected = poly_name in self.selected_polylines
+
+                    # Get classification mode
+                    mode = getattr(self, 'classification_mode', 'none')
+
+                    if is_selected and mode == 'fault':
+                        # SELECTED fault in fault mode - bright yellow/gold highlight
+                        color = '#FFD700'  # Gold
+                        linewidth = 5.0  # Very thick
                         linestyle = "-"
-                        zorder = 10  # Higher z-order to appear on top
+                        zorder = 15  # On top of everything
                         line_alpha = 1.0
+                    elif fault_assignment or is_fault:
+                        if fault_assignment and fault_assignment in self.defined_faults:
+                            base_color = self.defined_faults[fault_assignment].get('color', 'red')
+                        else:
+                            base_color = polyline.get("color", "red") if is_fault else "red"
+
+                        if mode == 'fault':
+                            # In fault mode - show faults with their colors but muted
+                            color = base_color
+                            linewidth = 2.5
+                            line_alpha = 0.6
+                        else:
+                            color = base_color
+                            linewidth = 3.5
+                            line_alpha = 1.0
+                        linestyle = "-"
+                        zorder = 10
                     elif not is_line_assigned:
                         # Unassigned polyline - show with 50% transparency and dashed
                         color = polyline.get("color", "#888888")
@@ -3255,8 +3272,7 @@ class GeologicalCrossSectionGUI:
                         zorder = 9
                         line_alpha = 0.8
 
-                    # Apply transparency based on classification mode
-                    mode = getattr(self, 'classification_mode', 'none')
+                    # Apply de-emphasis based on classification mode
                     if mode == 'polygon' or mode == 'contact':
                         # In polygon/contact mode, faults are de-emphasized
                         line_alpha = 0.25
@@ -7842,12 +7858,21 @@ class GeologicalCrossSectionGUI:
                     self.status_var.set("Click on a node (not endpoint) to split the contact")
 
             elif mode == "add":
-                # ADD mode: click on a line to add a node there
+                # ADD mode: click on a line to add a node there, then immediately drag it
                 clicked_line = self._find_contact_line_at(event.xdata, event.ydata)
                 if clicked_line:
                     group_name, segment_idx, node_data = clicked_line
                     logger.debug(f"  ADD mode: inserting node at segment {segment_idx} of {group_name}")
-                    self._insert_node_at_segment(group_name, segment_idx, node_data, event.xdata, event.ydata)
+                    new_node_idx = self._insert_node_at_segment(group_name, segment_idx, node_data, event.xdata, event.ydata)
+                    # Start dragging the newly inserted node immediately
+                    if new_node_idx is not None:
+                        # Select the new node
+                        self.selected_contact_nodes = [(group_name, new_node_idx, node_data)]
+                        self._update_contact_node_highlights()
+                        # Start dragging
+                        self.dragging_node = (group_name, new_node_idx, node_data)
+                        self.drag_start_pos = (event.xdata, event.ydata)
+                        self.status_var.set(f"Added node - drag to position")
                 else:
                     self.status_var.set("Click on a contact line to add a node")
 
@@ -8480,20 +8505,25 @@ class GeologicalCrossSectionGUI:
         self._update_node_selection_display()
 
     def _insert_node_at_segment(self, group_name, segment_idx, node_data, click_x, click_y):
-        """Insert a new node on a contact line segment at the clicked position."""
+        """Insert a new node on a contact line segment at the clicked position.
+
+        Returns:
+            int: The index of the newly inserted node, or None if insertion failed.
+        """
         polyline = node_data.get('polyline')
         if not polyline:
-            return
+            return None
 
         vertices = list(polyline.vertices)
 
         # Insert position is after segment_idx
         insert_vert_idx = (segment_idx + 1) * 2
+        new_node_idx = segment_idx + 1
 
         # Save state for undo
         self._push_undo('insert_node', {
             'group_name': group_name,
-            'node_idx': segment_idx + 1,
+            'node_idx': new_node_idx,
             'polyline': polyline
         })
 
@@ -8512,8 +8542,8 @@ class GeologicalCrossSectionGUI:
                 pdf_verts.insert(insert_vert_idx + 1, click_y)  # Placeholder
                 polyline.pdf_vertices = pdf_verts
 
-        self.status_var.set(f"Added node to {group_name}")
         self._update_node_selection_display()
+        return new_node_idx
 
     def _push_undo(self, action_type, data):
         """Push an action onto the undo stack."""
@@ -9586,41 +9616,84 @@ class GeologicalCrossSectionGUI:
         self.update_3d_view()
 
     def bulk_assign_selected(self):
-        """Bulk assign all selected units to the unit chosen in the combobox."""
-        if not self.selected_units:
-            messagebox.showinfo("No Selection", "Please select units first using 'Select Similar' or by clicking on the map.")
+        """Bulk assign selected items to the item chosen in the combobox.
+
+        In fault mode: assigns selected polylines to the selected fault
+        In polygon mode: assigns selected polygons to the selected unit
+        """
+        mode = getattr(self, 'classification_mode', 'none')
+        target_name = self.bulk_assign_combo.get()
+
+        if not target_name:
+            messagebox.showinfo("No Target Selected", "Please choose an item from the dropdown.")
             return
 
-        unit_name = self.bulk_assign_combo.get()
-        if not unit_name:
-            messagebox.showinfo("No Unit Selected", "Please choose a unit from the dropdown.")
-            return
+        if mode == 'fault':
+            # Fault mode: assign polylines to faults
+            if not self.selected_polylines:
+                messagebox.showinfo("No Selection", "Please select polylines first by clicking on them in the map.")
+                return
 
-        # Find the unit in defined_units
-        if unit_name not in self.defined_units:
-            messagebox.showerror("Error", f"Unit '{unit_name}' not found in defined units.")
-            return
+            if target_name not in self.defined_faults:
+                messagebox.showerror("Error", f"Fault '{target_name}' not found in defined faults.")
+                return
 
-        assigned_count = 0
-        for feature_name in list(self.selected_units):
-            if feature_name in self.all_geological_units:
-                self._assign_polygon_to_unit(feature_name, unit_name)
+            assigned_count = 0
+            for line_name in list(self.selected_polylines):
+                self._assign_line_to_fault(line_name, target_name)
                 assigned_count += 1
 
-        if assigned_count > 0:
-            self.selected_units.clear()
-            self.update_selection_display()
-            self.update_section_display()
-            messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polygons to {unit_name}")
-            logger.info(f"Bulk assigned {assigned_count} polygons to {unit_name}")
+            if assigned_count > 0:
+                self.selected_polylines.clear()
+                self.update_selection_display()
+                self.update_section_display()
+                messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polylines to fault '{target_name}'")
+                logger.info(f"Bulk assigned {assigned_count} polylines to fault {target_name}")
+        else:
+            # Polygon mode (default): assign units to geological units
+            if not self.selected_units:
+                messagebox.showinfo("No Selection", "Please select units first using 'Select Similar' or by clicking on the map.")
+                return
+
+            if target_name not in self.defined_units:
+                messagebox.showerror("Error", f"Unit '{target_name}' not found in defined units.")
+                return
+
+            assigned_count = 0
+            for feature_name in list(self.selected_units):
+                if feature_name in self.all_geological_units:
+                    self._assign_polygon_to_unit(feature_name, target_name)
+                    assigned_count += 1
+
+            if assigned_count > 0:
+                self.selected_units.clear()
+                self.update_selection_display()
+                self.update_section_display()
+                messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polygons to {target_name}")
+                logger.info(f"Bulk assigned {assigned_count} polygons to {target_name}")
 
     def update_bulk_assign_combo(self):
-        """Update the bulk assignment combobox with available units."""
+        """Update the bulk assignment combobox based on current classification mode.
+
+        In polygon mode: shows available geological units
+        In fault mode: shows available faults
+        In other modes: shows units (default)
+        """
         if hasattr(self, 'bulk_assign_combo'):
-            unit_names = [unit.name for unit in self.strat_column.get_all_units_ordered()]
-            self.bulk_assign_combo['values'] = unit_names
-            if unit_names and not self.bulk_assign_combo.get():
-                self.bulk_assign_combo.set(unit_names[0])
+            mode = getattr(self, 'classification_mode', 'none')
+
+            if mode == 'fault':
+                # Show faults in fault mode
+                fault_names = list(self.defined_faults.keys())
+                self.bulk_assign_combo['values'] = fault_names
+                if fault_names and self.bulk_assign_combo.get() not in fault_names:
+                    self.bulk_assign_combo.set(fault_names[0] if fault_names else '')
+            else:
+                # Show units in polygon mode and other modes
+                unit_names = [unit.name for unit in self.strat_column.get_all_units_ordered()]
+                self.bulk_assign_combo['values'] = unit_names
+                if unit_names and self.bulk_assign_combo.get() not in unit_names:
+                    self.bulk_assign_combo.set(unit_names[0] if unit_names else '')
 
     def assign_selected_units(self, strat_unit):
         """Assign selected units to a stratigraphic unit."""
@@ -9952,7 +10025,10 @@ class GeologicalCrossSectionGUI:
             btn.config(relief=tk.RAISED, bd=2)
         for btn in self.fault_buttons.values():
             btn.config(relief=tk.RAISED, bd=2)
-        
+
+        # Update bulk assign dropdown for the new mode
+        self.update_bulk_assign_combo()
+
         self.update_section_display()
 
     def refresh_feature_browser(self):
@@ -10467,6 +10543,9 @@ class GeologicalCrossSectionGUI:
             btn_del = ttk.Button(row_frame, text="✕", width=2,
                                 command=lambda f=fault_name: self.delete_fault(f))
             btn_del.pack(side=tk.LEFT, padx=1)
+
+        # Update dropdown if in fault mode
+        self.update_bulk_assign_combo()
 
     def edit_fault(self, fault_name: str):
         """Edit a fault's properties (color, type)."""
