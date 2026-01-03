@@ -2817,27 +2817,36 @@ class GeologicalCrossSectionGUI:
                     page_polylines = {}
                     fault_count = 0
                     polyline_count = 0
+                    unassigned_count = 0
                     for annot_idx, annot in enumerate(annotations):
                         annot_type = annot.get("type", "")
-                        
+
                         # Include both PolyLine types AND Fault types
                         if annot_type in ("PolyLine", "Fault"):
                             is_fault = (annot_type == "Fault")
-                            
-                            # Get the annotation name (author field)
-                            annot_name = annot.get("name", "")
-                            if not annot_name:
-                                annot_name = annot.get("author", "")
-                            
+
+                            # Use SUBJECT for naming, not author!
+                            # This fixes the f123456 being detected as fault issue
+                            subject = annot.get("subject", "") or ""
+                            author = annot.get("author", "") or ""
+                            annot_name = annot.get("name", "")  # Already set from subject in extraction
+
+                            # Check if this is assigned (has meaningful metadata)
+                            is_assigned = annot.get("is_assigned", True)
+                            visual_props = annot.get("visual_properties", {})
+
                             if is_fault:
                                 fault_count += 1
+                                # fault_name comes from subject (set during extraction)
                                 fault_name = annot_name if annot_name else f"Fault{fault_count}"
                                 polyline_name = f"F{fault_count}_{fault_name}"
                             else:
                                 polyline_count += 1
-                                # Use annotation name for non-fault polylines too
-                                polyline_name = annot_name if annot_name else f"PL{polyline_count}"
-                            
+                                # Use subject-based name for non-fault polylines
+                                polyline_name = annot_name if annot_name and annot_name != "PolyLine" else f"PL{polyline_count}"
+                                if not is_assigned:
+                                    unassigned_count += 1
+
                             unique_polyline_name = f"{pdf_path.stem}_P{page_num+1}_{polyline_name}"
 
                             polyline_data = {
@@ -2847,9 +2856,12 @@ class GeologicalCrossSectionGUI:
                                 "color": annot.get("color", (1, 0, 0) if is_fault else (0, 0, 0)),
                                 "type": annot_type,
                                 "is_fault": is_fault,
-                                "fault_name": annot_name if annot_name else None,
-                                "fault_assignment": annot_name if annot_name else None,
-                                "author": annot.get("author", ""),  # Store author for auto-assignment
+                                "fault_name": annot_name if is_fault else None,  # Only set for faults
+                                "fault_assignment": annot_name if is_fault else None,  # Only set for faults
+                                "author": author,  # Store author separately
+                                "subject": subject,  # Store subject for reference
+                                "is_assigned": is_assigned,  # Track assignment status
+                                "visual_properties": visual_props,  # For similarity matching
                             }
 
                             # Transform polyline vertices if transform available
@@ -2866,53 +2878,12 @@ class GeologicalCrossSectionGUI:
 
                             page_polylines[unique_polyline_name] = polyline_data
                     
-                    if fault_count > 0:
-                        logger.info(f"  Extracted {fault_count} faults, {polyline_count} other polylines")
+                    if fault_count > 0 or unassigned_count > 0:
+                        logger.info(f"  Extracted {fault_count} faults, {polyline_count} other polylines ({unassigned_count} unassigned)")
 
-                    # Extract contacts using new centerline method
+                    # NOTE: Contact extraction is now DEFERRED until user clicks "Extract Contacts"
+                    # This allows users to first assign any unassigned features before contacts are calculated
                     page_contacts = []
-                    if self.feature_extractor.geological_units:
-                        # Build temporary section data for contact extraction
-                        temp_section_data = {
-                            (pdf_path, page_num): {
-                                "units": dict(self.feature_extractor.geological_units),
-                                "northing": section_northing,
-                                "faults": list(page_polylines.values()),
-                            }
-                        }
-                        
-                        # Use new grouped contact extractor
-                        # Build temp model_boundaries dict for this section
-                        temp_model_boundaries = {}
-                        if section_northing_val in self.model_boundaries:
-                            temp_model_boundaries[section_northing] = self.model_boundaries[section_northing_val]
-
-                        grouped = extract_contacts_grouped(
-                            temp_section_data,
-                            sample_distance=2.0,
-                            proximity_threshold=10.0,
-                            min_contact_length=5.0,
-                            simplify_tolerance=1.0,
-                            model_boundaries=temp_model_boundaries
-                        )
-                        
-                        # Flatten grouped contacts to list format
-                        for group_name, group in grouped.items():
-                            for polyline in group.polylines:
-                                contact = {
-                                    "name": group_name,
-                                    "vertices": polyline.vertices,
-                                    "formation1": group.formation1,
-                                    "formation2": group.formation2,
-                                    "source_pdf": str(pdf_path),
-                                    "page_num": page_num,
-                                    "unique_name": f"{pdf_path.stem}_P{page_num+1}_{group_name}",
-                                    "northing": section_northing,
-                                }
-                                page_contacts.append(contact)
-                                self.all_contacts.append(contact)
-
-                        total_contacts += len(page_contacts)
 
                     # Build inverse transform for PDF coordinate conversion
                     inverse_transform = self.georeferencer.build_inverse_transformation()
@@ -3188,6 +3159,9 @@ class GeologicalCrossSectionGUI:
 
                     is_selected = unit_name in self.selected_units
 
+                    # Check if item is assigned (has meaningful metadata or user assignment)
+                    is_item_assigned = unit.get("is_assigned", True)  # Default True for backward compat
+
                     # Get color from assignment if available
                     unit_assignment = unit.get("unit_assignment")
                     if unit_assignment and unit_assignment in self.defined_units:
@@ -3203,6 +3177,12 @@ class GeologicalCrossSectionGUI:
                             color = assigned_color
                         alpha = 0.6  # Higher alpha for assigned units
                         edgecolor = "darkblue"  # Distinct edge for assigned
+                        is_item_assigned = True  # Has assignment = assigned
+                    elif not is_item_assigned:
+                        # Unassigned item - show with 50% transparency and gray edge
+                        color = unit.get("color", (0.5, 0.5, 0.5))
+                        alpha = 0.5  # 50% transparency for unassigned
+                        edgecolor = "#888888"  # Gray edge to indicate unassigned
                     else:
                         color = unit.get("color", (0.5, 0.5, 0.5))
                         alpha = 0.3
@@ -3248,7 +3228,8 @@ class GeologicalCrossSectionGUI:
                     # Check for fault assignment first, then fault_name
                     fault_assignment = polyline.get("fault_assignment") or polyline.get("fault_name")
                     is_fault = polyline.get("is_fault", False) or polyline.get("type") == "Fault"
-                    
+                    is_line_assigned = polyline.get("is_assigned", True)  # Default True for backward compat
+
                     if fault_assignment or is_fault:
                         if fault_assignment and fault_assignment in self.defined_faults:
                             color = self.defined_faults[fault_assignment].get('color', 'red')
@@ -3258,6 +3239,13 @@ class GeologicalCrossSectionGUI:
                         linestyle = "-"
                         zorder = 10  # Higher z-order to appear on top
                         line_alpha = 1.0
+                    elif not is_line_assigned:
+                        # Unassigned polyline - show with 50% transparency and dashed
+                        color = polyline.get("color", "#888888")
+                        linewidth = 2.0
+                        linestyle = ":"  # Dotted for unassigned
+                        zorder = 8
+                        line_alpha = 0.5  # 50% transparency for unassigned
                     else:
                         color = "black"  # Changed from gray for better visibility
                         linewidth = 2.5  # Thicker
@@ -8955,9 +8943,15 @@ class GeologicalCrossSectionGUI:
                 self.polyline_listbox.insert(tk.END, poly_name)
 
     def clear_selection(self):
-        """Clear all selected units."""
+        """Clear all selected units, polylines, and contacts."""
         self.selected_units.clear()
+        self.selected_polylines.clear()
+        if hasattr(self, 'selected_contacts'):
+            self.selected_contacts.clear()
+        if hasattr(self, 'selected_feature'):
+            self.selected_feature.clear()
         self.update_selection_display()
+        self.update_polyline_selection_display() if hasattr(self, 'update_polyline_selection_display') else None
         self.update_section_display()
         self.update_3d_view()
 
@@ -8992,27 +8986,105 @@ class GeologicalCrossSectionGUI:
             count = len(new_selections)
             self.status_var.set(f"Selected {count} contact groups with similar formations")
 
-        # Polygon mode - existing behavior
+        # Polygon/Fault mode - use subject or visual properties
         else:
-            if not self.selected_units:
-                messagebox.showinfo("No Selection", "Please select at least one unit first")
+            # Check both selected_units and selected_polylines
+            if not self.selected_units and not getattr(self, 'selected_polylines', set()):
+                messagebox.showinfo("No Selection", "Please select at least one feature first")
                 return
 
-            selected_formations = set()
+            # Gather similarity criteria from selected items
+            # Priority 1: Subject line (if not default)
+            # Priority 2: Visual properties (color, stroke, line weight)
+            selected_subjects = set()
+            selected_visual_keys = set()
+
+            def get_visual_key(item):
+                """Create a key from visual properties for similarity matching."""
+                props = item.get("visual_properties", {})
+                stroke = props.get("stroke_color")
+                fill = props.get("fill_color")
+                width = props.get("line_width")
+                # Also use the actual color if visual_properties is not set
+                color = item.get("color", (0.5, 0.5, 0.5))
+                if stroke:
+                    stroke_key = tuple(round(c * 10) / 10 for c in stroke[:3])
+                else:
+                    stroke_key = None
+                if fill:
+                    fill_key = tuple(round(c * 10) / 10 for c in fill[:3])
+                else:
+                    fill_key = None
+                # Round color for matching
+                color_key = tuple(round(c * 10) / 10 for c in color[:3]) if isinstance(color, (list, tuple)) else None
+                width_key = round(width, 1) if width else None
+                return (stroke_key, fill_key, color_key, width_key)
+
+            def is_default_subject(subject):
+                """Check if subject is a default/generic name."""
+                if not subject:
+                    return True
+                subject_lower = subject.lower().strip()
+                defaults = {'line', 'polyline', 'polygon', 'circle', 'square', 'rectangle',
+                            'shape', 'drawing', 'annotation', 'ink', 'freehand', 'unit', ''}
+                return subject_lower in defaults
+
+            # Process selected units
             for unit_name in self.selected_units:
                 if unit_name in self.all_geological_units:
                     unit = self.all_geological_units[unit_name]
-                    selected_formations.add(unit.get("formation", "UNIT"))
+                    subject = unit.get("subject", "") or unit.get("formation", "")
+                    if subject and not is_default_subject(subject):
+                        selected_subjects.add(subject.upper())
+                    else:
+                        # Fall back to visual properties
+                        selected_visual_keys.add(get_visual_key(unit))
 
-            new_selections = set()
+            # Process selected polylines
+            for poly_name in getattr(self, 'selected_polylines', set()):
+                for (pdf, page), section_data in self.all_sections_data.items():
+                    if poly_name in section_data.get("polylines", {}):
+                        polyline = section_data["polylines"][poly_name]
+                        subject = polyline.get("subject", "") or polyline.get("fault_name", "")
+                        if subject and not is_default_subject(subject):
+                            selected_subjects.add(subject.upper())
+                        else:
+                            selected_visual_keys.add(get_visual_key(polyline))
+
+            # Find matching items
+            new_unit_selections = set()
+            new_polyline_selections = set()
+
+            # Match units
             for unit_name, unit in self.all_geological_units.items():
-                if unit.get("formation", "UNIT") in selected_formations:
-                    new_selections.add(unit_name)
+                subject = unit.get("subject", "") or unit.get("formation", "")
+                if subject and subject.upper() in selected_subjects:
+                    new_unit_selections.add(unit_name)
+                elif get_visual_key(unit) in selected_visual_keys:
+                    new_unit_selections.add(unit_name)
 
-            self.selected_units = new_selections
+            # Match polylines
+            for (pdf, page), section_data in self.all_sections_data.items():
+                for poly_name, polyline in section_data.get("polylines", {}).items():
+                    subject = polyline.get("subject", "") or polyline.get("fault_name", "")
+                    if subject and subject.upper() in selected_subjects:
+                        new_polyline_selections.add(poly_name)
+                    elif get_visual_key(polyline) in selected_visual_keys:
+                        new_polyline_selections.add(poly_name)
+
+            self.selected_units = new_unit_selections
+            if hasattr(self, 'selected_polylines'):
+                self.selected_polylines = new_polyline_selections
+            else:
+                self.selected_polylines = new_polyline_selections
+
+            total_selected = len(new_unit_selections) + len(new_polyline_selections)
+            match_type = "subject" if selected_subjects else "visual properties"
+            self.status_var.set(f"Selected {total_selected} items by {match_type}")
 
         self.update_selection_display()
         self.update_section_display()
+        self.update_polyline_selection_display() if hasattr(self, 'update_polyline_selection_display') else None
         self.update_3d_view()
 
     def bulk_assign_selected(self):

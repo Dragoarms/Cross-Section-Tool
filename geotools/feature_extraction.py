@@ -269,14 +269,71 @@ class FeatureExtractor:
         author = self._get_author_from_annot(annot)
         return author is not None and author.strip() != ''
 
+    def _get_subject_from_annot(self, annot) -> Optional[str]:
+        """Get subject line from annotation metadata."""
+        if not hasattr(annot, 'info'):
+            return None
+        info = annot.info
+        return info.get('subject', '') or info.get('content', '')
+
+    def _get_visual_properties(self, annot) -> Dict:
+        """Extract visual properties from annotation for similarity matching.
+
+        Returns dict with:
+        - stroke_color: RGB tuple for stroke/line color
+        - fill_color: RGB tuple for fill color
+        - line_width: Line/border width
+        - dashes: Dash pattern if any
+        """
+        props = {
+            'stroke_color': None,
+            'fill_color': None,
+            'line_width': None,
+            'dashes': None,
+        }
+
+        # Get colors
+        if hasattr(annot, 'colors') and annot.colors:
+            stroke = annot.colors.get('stroke')
+            fill = annot.colors.get('fill')
+            if stroke and len(stroke) >= 3:
+                props['stroke_color'] = tuple(stroke[:3])
+            if fill and len(fill) >= 3:
+                props['fill_color'] = tuple(fill[:3])
+
+        # Get border/line width
+        if hasattr(annot, 'border'):
+            border = annot.border
+            if border and len(border) >= 1:
+                props['line_width'] = border[0] if isinstance(border, (list, tuple)) else border
+
+        # Get dash pattern from border
+        if hasattr(annot, 'border') and annot.border:
+            border = annot.border
+            if isinstance(border, (list, tuple)) and len(border) >= 4:
+                # Border format: [width, style, dash_array...]
+                props['dashes'] = border[3:] if len(border) > 3 else None
+
+        return props
+
+    def _is_default_subject(self, subject: str) -> bool:
+        """Check if subject is a default/generic name that shouldn't be used for grouping."""
+        if not subject:
+            return True
+        subject_lower = subject.lower().strip()
+        default_names = {'line', 'polyline', 'polygon', 'circle', 'square', 'rectangle',
+                         'shape', 'drawing', 'annotation', 'ink', 'freehand', ''}
+        return subject_lower in default_names
+
     def extract_annotations(self, page) -> List[Dict]:
         """
         Extract annotations from PDF page.
 
-        Filtering rules:
-        - ONLY extract items that have an 'author' tag (title/author metadata)
-        - Lines/PolyLines: Extract if has author tag, classify as Fault if subject contains 'Fault'
-        - Polygons: Extract if has author tag (including grayscale if has author)
+        Now extracts ALL items (not just those with author tags):
+        - Items with author tags are marked as 'assigned'
+        - Items without author tags are marked as 'unassigned' for manual assignment
+        - Uses subject line for naming (not author) to avoid f123456 being detected as faults
+        - Stores visual properties for similarity-based selection
 
         Returns:
             List of annotation dictionaries (polygons + faults combined for backward compatibility)
@@ -291,27 +348,27 @@ class FeatureExtractor:
 
             polygons_found = 0
             faults_found = 0
-            skipped_no_author = 0
+            lines_found = 0
+            unassigned_found = 0
             skipped_filtered = 0
             skipped_too_few_points = 0
 
             for annot in page.annots():
                 annot_type = annot.type[0]
 
-                # CRITICAL: Only extract items with author tag
+                # Get metadata - author and subject are SEPARATE
                 has_author = self._has_author_tag(annot)
-                author = self._get_author_from_annot(annot)
+                author = self._get_author_from_annot(annot) or ""
+                subject = self._get_subject_from_annot(annot) or ""
 
-                if not has_author:
-                    skipped_no_author += 1
-                    logger.debug(f"Skipped annotation - no author tag")
-                    continue
-
-                # Check group filter
-                if not self._should_include_annotation(author):
+                # Check group filter (only if author exists)
+                if has_author and not self._should_include_annotation(author):
                     skipped_filtered += 1
                     logger.debug(f"Skipped annotation - filtered out group: {author}")
                     continue
+
+                # Get visual properties for similarity matching
+                visual_props = self._get_visual_properties(annot)
 
                 # Check if this is a line/polyline/ink (types 3, 7, 14)
                 # Type 3: Line, Type 7: PolyLine, Type 14: Ink (freehand drawing)
@@ -320,78 +377,93 @@ class FeatureExtractor:
                 # Check if this is a polygon type (types 4, 5, 6, 10)
                 is_polygon_type = annot_type in [4, 5, 6, 10]  # Square, Circle, Highlight, Polygon
 
-                # Check if subject indicates this is a fault
+                # Check if subject indicates this is a fault (use SUBJECT, not author!)
                 is_fault, fault_name = self._is_fault_line(annot)
 
+                # Determine if this is an "assigned" item (has meaningful metadata)
+                # Items without author OR with default subject are considered unassigned
+                is_assigned = has_author and not self._is_default_subject(subject)
+
                 if is_line_type:
-                    # Lines with author tag - extract them
+                    # Extract line/polyline
                     vertices = self._extract_vertices(annot)
                     if vertices and len(vertices) >= 4:
                         color = self._get_color(annot) or (1.0, 0.0, 0.0)  # Default red for lines
 
                         if is_fault:
-                            # This is a fault line
+                            # This is a fault line - use SUBJECT for fault_name, not author
                             fault_data = {
                                 "type": "Fault",
-                                "name": fault_name,
+                                "name": fault_name,  # From subject, not author
                                 "vertices": vertices,
                                 "color": color,
                                 "formation": "FAULT",
                                 "classification": "FAULT",
                                 "source": "annotation",
                                 "author": author,
+                                "subject": subject,
+                                "is_assigned": True,  # Faults are always assigned
+                                "visual_properties": visual_props,
                             }
                             annotations.append(fault_data)
                             extracted_faults.append(fault_data)
                             faults_found += 1
-                            logger.debug(f"Extracted fault: {fault_name} (author: {author})")
+                            logger.debug(f"Extracted fault: {fault_name} (author: {author}, subject: {subject})")
                         else:
-                            # Regular polyline with author - could be a contact or other feature
+                            # Regular polyline - use subject if available, otherwise generic name
+                            display_name = subject if subject and not self._is_default_subject(subject) else "PolyLine"
                             polyline_data = {
                                 "type": "PolyLine",
-                                "name": author or "PolyLine",
+                                "name": display_name,
                                 "vertices": vertices,
                                 "color": color,
-                                "formation": author or "LINE",
+                                "formation": display_name if display_name != "PolyLine" else "LINE",
                                 "classification": "LINE",
                                 "source": "annotation",
                                 "author": author,
+                                "subject": subject,
+                                "is_assigned": is_assigned,
+                                "visual_properties": visual_props,
                             }
                             annotations.append(polyline_data)
-                            logger.debug(f"Extracted polyline: {author}")
+                            lines_found += 1
+                            if not is_assigned:
+                                unassigned_found += 1
+                            logger.debug(f"Extracted polyline: {display_name} (assigned: {is_assigned})")
                     else:
                         skipped_too_few_points += 1
 
                 elif is_polygon_type:
-                    # Polygons with author tag - extract regardless of color (grayscale OK)
+                    # Extract all polygons - mark as assigned/unassigned based on metadata
                     vertices = self._extract_vertices(annot)
 
                     if vertices and len(vertices) >= 6:
                         color = self._get_color(annot) or (0.5, 0.5, 0.5)  # Default gray
 
                         if is_fault:
-                            # Fault polygon
+                            # Fault polygon - use SUBJECT for fault_name
                             fault_data = {
                                 "type": "Fault",
-                                "name": fault_name,
+                                "name": fault_name,  # From subject
                                 "vertices": vertices,
                                 "color": color,
                                 "formation": "FAULT",
                                 "classification": "FAULT",
                                 "source": "annotation",
                                 "author": author,
+                                "subject": subject,
+                                "is_assigned": True,  # Faults are always assigned
+                                "visual_properties": visual_props,
                             }
                             annotations.append(fault_data)
                             extracted_faults.append(fault_data)
                             faults_found += 1
-                            logger.debug(f"Extracted fault polygon: {fault_name} (author: {author})")
+                            logger.debug(f"Extracted fault polygon: {fault_name} (author: {author}, subject: {subject})")
                         else:
                             # Geological unit polygon - use subject as formation name
                             formation, from_subject = self._get_formation_with_source(annot, color)
-                            # If formation couldn't be determined from subject, use author
-                            if formation == "UNIT" and author:
-                                formation = author.strip().upper()
-                                from_subject = True  # Treat author as explicit assignment
+                            # If formation couldn't be determined from subject, keep as UNIT
+                            # Do NOT fall back to author (which might be f123456)
 
                             # Check for saved assignment from previous session
                             saved_assignment = self._get_saved_assignment(annot)
@@ -406,11 +478,16 @@ class FeatureExtractor:
                                 "classification": "UNIT",
                                 "source": "annotation",
                                 "author": author,
+                                "subject": subject,
                                 "unit_assignment": saved_assignment,  # Pre-populate if saved
+                                "is_assigned": is_assigned or saved_assignment is not None,
+                                "visual_properties": visual_props,
                             }
                             annotations.append(polygon_data)
                             polygons_found += 1
-                            logger.debug(f"Extracted polygon: {formation} (author: {author}, from_subject: {from_subject}, saved: {saved_assignment})")
+                            if not is_assigned and not saved_assignment:
+                                unassigned_found += 1
+                            logger.debug(f"Extracted polygon: {formation} (author: {author}, subject: {subject}, assigned: {is_assigned})")
                     else:
                         skipped_too_few_points += 1
 
@@ -418,7 +495,8 @@ class FeatureExtractor:
             logger.info(f"Annotation extraction summary:")
             logger.info(f"  - Polygons found: {polygons_found}")
             logger.info(f"  - Faults found: {faults_found}")
-            logger.info(f"  - Skipped (no author tag): {skipped_no_author}")
+            logger.info(f"  - Lines found: {lines_found}")
+            logger.info(f"  - Unassigned items: {unassigned_found}")
             logger.info(f"  - Skipped (filtered out): {skipped_filtered}")
             logger.info(f"  - Skipped (too few points): {skipped_too_few_points}")
 
