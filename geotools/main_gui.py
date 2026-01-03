@@ -19,7 +19,8 @@ matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.backends._backend_tk import NavigationToolbar2Tk
-from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.patches import Polygon as MplPolygon, PathPatch
+from matplotlib.path import Path as MplPath
 from pathlib import Path
 import logging
 import sys
@@ -199,6 +200,14 @@ class GeologicalCrossSectionGUI:
         self.contact_undo_stack = []  # List of (action, data) tuples
         self.contact_redo_stack = []
         self.max_undo_history = 50
+
+        # Bezier curve editing state
+        # bezier_controls: Dict[group_name, List[Optional[tuple]]]
+        # Each entry is control points for a segment: ((ctrl1_x, ctrl1_y), (ctrl2_x, ctrl2_y))
+        # None means straight line segment
+        self.bezier_controls = {}  # {group_name: [segment0_controls, segment1_controls, ...]}
+        self.dragging_bezier_segment = None  # (group_name, segment_idx) when dragging a segment
+        self.bezier_preview_line = None  # Preview line artist during bezier editing
 
         # Flag to prevent hover selection during scroll
         self.scrolling_sections = False
@@ -3339,25 +3348,45 @@ class GeologicalCrossSectionGUI:
                                     contact_width = 2.5
                                     contact_color = '#00AA00'  # Green
 
-                                # Draw contact line (pickable in contact mode)
-                                contact_line = ax.plot(
-                                    x, z,
-                                    color=contact_color,
-                                    linewidth=contact_width,
-                                    linestyle='-',
-                                    alpha=contact_alpha,
-                                    zorder=11 if is_selected else 8,
-                                    picker=8 if mode == 'contact' else False,
-                                )[0]
+                                # Draw contact line - use bezier curves if controls defined
+                                contact_zorder = 11 if is_selected else 8
+                                has_bezier = group_name in self.bezier_controls and any(
+                                    c is not None for c in self.bezier_controls.get(group_name, [])
+                                )
+
+                                if has_bezier:
+                                    # Draw using bezier path
+                                    contact_line = self._draw_bezier_path(
+                                        ax, x, z, group_name,
+                                        contact_color, contact_width, contact_alpha, contact_zorder
+                                    )
+                                    # Also draw a transparent line for picking
+                                    picker_line = ax.plot(
+                                        x, z, color='none', linewidth=contact_width * 2,
+                                        picker=8 if mode == 'contact' else False, zorder=1
+                                    )[0]
+                                else:
+                                    # Draw simple line (pickable in contact mode)
+                                    contact_line = ax.plot(
+                                        x, z,
+                                        color=contact_color,
+                                        linewidth=contact_width,
+                                        linestyle='-',
+                                        alpha=contact_alpha,
+                                        zorder=contact_zorder,
+                                        picker=8 if mode == 'contact' else False,
+                                    )[0]
+                                    picker_line = contact_line
 
                                 # Store for selection handling
-                                self.contact_patches[contact_line] = {
+                                self.contact_patches[picker_line] = {
                                     "group_name": group_name,
                                     "formation1": group.formation1,
                                     "formation2": group.formation2,
                                     "vertices": vertices,
                                     "northing": northing,
                                     "polyline": polyline,
+                                    "bezier_line": contact_line if has_bezier else None,
                                 }
 
                                 # Draw nodes when in contact editing mode
@@ -7676,6 +7705,7 @@ class GeologicalCrossSectionGUI:
             ("Drag", "drag", "Click and drag selected nodes to move them"),
             ("Delete", "delete", "Click node to delete it"),
             ("Add", "add", "Click on line to add node"),
+            ("Curve", "curve", "Click and drag line segment to create bezier curve"),
             ("Split", "split", "Click node to split contact into two"),
             ("Draw", "draw", "Extend from ends or relocate middle nodes"),
         ]
@@ -7730,6 +7760,7 @@ class GeologicalCrossSectionGUI:
             "drag": "DRAG mode: Click and drag to move selected nodes",
             "delete": "DELETE mode: Click a node to remove it",
             "add": "ADD mode: Click on a contact line to add a new node",
+            "curve": "CURVE mode: Click and drag a line segment to create/adjust a bezier curve",
             "split": "SPLIT mode: Click a node to split the contact into two at that point",
             "draw": "DRAW mode: Click first/last node to extend, or middle node to relocate",
         }
@@ -7738,6 +7769,9 @@ class GeologicalCrossSectionGUI:
         # Cancel any ongoing drawing when switching modes
         if mode != "draw":
             self._cancel_drawing()
+        # Cancel any bezier dragging
+        if mode != "curve":
+            self.dragging_bezier_segment = None
 
     def _update_edit_mode_buttons(self):
         """Update the visual state of edit mode buttons."""
@@ -7886,6 +7920,18 @@ class GeologicalCrossSectionGUI:
                 else:
                     self.status_var.set("Click on a contact line to add a node")
 
+            elif mode == "curve":
+                # CURVE mode: click on a line segment to start creating/adjusting a bezier curve
+                clicked_line = self._find_contact_line_at(event.xdata, event.ydata)
+                if clicked_line:
+                    group_name, segment_idx, node_data = clicked_line
+                    logger.debug(f"  CURVE mode: starting bezier drag on segment {segment_idx} of {group_name}")
+                    self.dragging_bezier_segment = (group_name, segment_idx, node_data)
+                    self.drag_start_pos = (event.xdata, event.ydata)
+                    self.status_var.set(f"Drag to curve segment {segment_idx} of {group_name}")
+                else:
+                    self.status_var.set("Click and drag on a contact line to create a curve")
+
             elif mode == "draw":
                 # DRAW mode:
                 # - Click anywhere to start/continue drawing
@@ -7945,6 +7991,7 @@ class GeologicalCrossSectionGUI:
         if not self.contact_editing:
             return
 
+        # Handle node dragging completion
         if self.dragging_node and self.drag_start_pos and event.xdata and event.ydata:
             # Check if we actually moved (not just clicked)
             dx = event.xdata - self.drag_start_pos[0]
@@ -7953,7 +8000,46 @@ class GeologicalCrossSectionGUI:
                 # Move all selected nodes by the same delta
                 self._move_selected_nodes(dx, dy)
 
+        # Handle bezier curve dragging completion
+        if self.dragging_bezier_segment and event.xdata and event.ydata:
+            group_name, segment_idx, node_data = self.dragging_bezier_segment
+            x_coords = node_data.get('x_coords', [])
+            z_coords = node_data.get('z_coords', [])
+
+            if segment_idx < len(x_coords) - 1:
+                p0 = (x_coords[segment_idx], z_coords[segment_idx])
+                p1 = (x_coords[segment_idx + 1], z_coords[segment_idx + 1])
+                drag_point = (event.xdata, event.ydata)
+
+                # Calculate bezier control points
+                controls = self._calculate_bezier_controls_for_point(p0, p1, drag_point)
+
+                if controls:
+                    # Save for undo
+                    old_controls = self._get_bezier_controls_for_segment(group_name, segment_idx)
+                    self._push_undo('bezier_curve', {
+                        'group_name': group_name,
+                        'segment_idx': segment_idx,
+                        'old_controls': old_controls,
+                        'new_controls': controls
+                    })
+
+                    # Set the new bezier controls
+                    self._set_bezier_controls_for_segment(group_name, segment_idx, controls)
+                    self.status_var.set(f"Created bezier curve on segment {segment_idx}")
+
+                    # Refresh display to show the curve
+                    self.update_section_display()
+                else:
+                    self.status_var.set("Released near midpoint - keeping straight line")
+
+            # Clear bezier preview
+            self._clear_bezier_preview()
+            if hasattr(self, 'canvas_sections'):
+                self.canvas_sections.draw_idle()
+
         self.dragging_node = None
+        self.dragging_bezier_segment = None
         self.drag_start_pos = None
 
     def on_section_key_press(self, event):
@@ -8163,6 +8249,236 @@ class GeologicalCrossSectionGUI:
         proj_y = y1 + t * dy
 
         return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
+
+    # ===== BEZIER CURVE HELPER FUNCTIONS =====
+
+    def _calculate_bezier_controls_for_point(self, p0, p1, drag_point, t=0.5):
+        """Calculate bezier control points so the curve passes through drag_point at parameter t.
+
+        Given start point p0, end point p1, and a point the curve should pass through,
+        calculates symmetric control points C1 and C2.
+
+        Uses the property: B(t) = (1-t)³P0 + 3(1-t)²tC1 + 3(1-t)t²C2 + t³P1
+
+        For symmetric handles, we place C1 and C2 along the line from drag_point
+        perpendicular to P0-P1, at positions that make B(t) = drag_point.
+        """
+        x0, y0 = p0
+        x1, y1 = p1
+        dx, dy = drag_point
+
+        # Coefficients for bezier at t
+        b0 = (1 - t) ** 3
+        b1 = 3 * (1 - t) ** 2 * t
+        b2 = 3 * (1 - t) * t ** 2
+        b3 = t ** 3
+
+        # We need: b0*P0 + b1*C1 + b2*C2 + b3*P1 = drag_point
+        # With symmetric handles relative to the midpoint:
+        # C1 = P0 + k * (mid - P0) and C2 = P1 + k * (mid - P1)
+        # where mid is the drag point
+
+        # Simpler approach: place controls to make a smooth curve through the point
+        # C1 is between P0 and drag_point, C2 is between drag_point and P1
+        # Solve for the factor k that places B(t) at drag_point
+
+        # For t=0.5: b0=0.125, b1=0.375, b2=0.375, b3=0.125
+        # 0.125*P0 + 0.375*C1 + 0.375*C2 + 0.125*P1 = drag_point
+        # Let C1 = P0 + a*(drag - P0), C2 = P1 + a*(drag - P1)
+        # 0.125*P0 + 0.375*(P0 + a*(drag-P0)) + 0.375*(P1 + a*(drag-P1)) + 0.125*P1 = drag
+        # 0.125*P0 + 0.375*P0 + 0.375*a*(drag-P0) + 0.375*P1 + 0.375*a*(drag-P1) + 0.125*P1 = drag
+        # 0.5*P0 + 0.5*P1 + 0.375*a*(2*drag - P0 - P1) = drag
+        # 0.5*(P0+P1) + 0.75*a*(drag - 0.5*(P0+P1)) = drag
+        # Let mid = 0.5*(P0+P1)
+        # mid + 0.75*a*(drag - mid) = drag
+        # 0.75*a*(drag - mid) = drag - mid
+        # a = 1/0.75 = 4/3 (when drag != mid)
+
+        mid_x = 0.5 * (x0 + x1)
+        mid_y = 0.5 * (y0 + y1)
+
+        # Check if drag point is at midpoint (no curve needed)
+        if abs(dx - mid_x) < 0.01 and abs(dy - mid_y) < 0.01:
+            return None  # Straight line
+
+        # Calculate control points
+        a = 4.0 / 3.0
+
+        c1_x = x0 + a * (dx - x0)
+        c1_y = y0 + a * (dy - y0)
+        c2_x = x1 + a * (dx - x1)
+        c2_y = y1 + a * (dy - y1)
+
+        return ((c1_x, c1_y), (c2_x, c2_y))
+
+    def _bezier_point(self, p0, c1, c2, p1, t):
+        """Calculate a point on a cubic bezier curve at parameter t."""
+        x = (1-t)**3 * p0[0] + 3*(1-t)**2*t * c1[0] + 3*(1-t)*t**2 * c2[0] + t**3 * p1[0]
+        y = (1-t)**3 * p0[1] + 3*(1-t)**2*t * c1[1] + 3*(1-t)*t**2 * c2[1] + t**3 * p1[1]
+        return (x, y)
+
+    def _bezier_curve_points(self, p0, c1, c2, p1, num_points=20):
+        """Generate points along a cubic bezier curve for plotting."""
+        points = []
+        for i in range(num_points + 1):
+            t = i / num_points
+            points.append(self._bezier_point(p0, c1, c2, p1, t))
+        return points
+
+    def _draw_bezier_path(self, ax, x_coords, z_coords, group_name, color, linewidth, alpha, zorder):
+        """Draw a polyline with bezier curves where control points are defined.
+
+        Returns the PathPatch artist for the line.
+        """
+        n_points = len(x_coords)
+        if n_points < 2:
+            return None
+
+        # Get bezier controls for this group
+        controls = self.bezier_controls.get(group_name, [])
+
+        # Build path commands
+        vertices = [(x_coords[0], z_coords[0])]
+        codes = [MplPath.MOVETO]
+
+        for i in range(n_points - 1):
+            p0 = (x_coords[i], z_coords[i])
+            p1 = (x_coords[i + 1], z_coords[i + 1])
+
+            # Check if this segment has bezier controls
+            if i < len(controls) and controls[i] is not None:
+                c1, c2 = controls[i]
+                # Cubic bezier: CURVE4 needs 3 vertices (c1, c2, endpoint)
+                vertices.extend([c1, c2, p1])
+                codes.extend([MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4])
+            else:
+                # Straight line
+                vertices.append(p1)
+                codes.append(MplPath.LINETO)
+
+        path = MplPath(vertices, codes)
+        patch = PathPatch(path, facecolor='none', edgecolor=color,
+                         linewidth=linewidth, alpha=alpha, zorder=zorder)
+        ax.add_patch(patch)
+        return patch
+
+    def _get_bezier_controls_for_segment(self, group_name, segment_idx):
+        """Get bezier control points for a specific segment, or None if straight."""
+        controls = self.bezier_controls.get(group_name, [])
+        if segment_idx < len(controls):
+            return controls[segment_idx]
+        return None
+
+    def _set_bezier_controls_for_segment(self, group_name, segment_idx, control_points):
+        """Set bezier control points for a specific segment.
+
+        control_points: ((c1_x, c1_y), (c2_x, c2_y)) or None for straight line
+        """
+        if group_name not in self.bezier_controls:
+            self.bezier_controls[group_name] = []
+
+        controls = self.bezier_controls[group_name]
+
+        # Extend the list if needed
+        while len(controls) <= segment_idx:
+            controls.append(None)
+
+        controls[segment_idx] = control_points
+
+    def _clear_bezier_controls(self, group_name):
+        """Clear all bezier controls for a group (reset to straight lines)."""
+        if group_name in self.bezier_controls:
+            del self.bezier_controls[group_name]
+
+    def _update_bezier_preview(self, mouse_x, mouse_y):
+        """Update the live preview of the bezier curve being dragged."""
+        if not self.dragging_bezier_segment:
+            return
+
+        group_name, segment_idx, node_data = self.dragging_bezier_segment
+        x_coords = node_data.get('x_coords', [])
+        z_coords = node_data.get('z_coords', [])
+
+        if segment_idx >= len(x_coords) - 1:
+            return
+
+        p0 = (x_coords[segment_idx], z_coords[segment_idx])
+        p1 = (x_coords[segment_idx + 1], z_coords[segment_idx + 1])
+        drag_point = (mouse_x, mouse_y)
+
+        # Calculate bezier control points
+        controls = self._calculate_bezier_controls_for_point(p0, p1, drag_point)
+
+        if not controls:
+            # Near midpoint - clear preview and return
+            self._clear_bezier_preview()
+            return
+
+        c1, c2 = controls
+
+        # Generate curve points for preview
+        curve_points = self._bezier_curve_points(p0, c1, c2, p1, num_points=30)
+        curve_x = [pt[0] for pt in curve_points]
+        curve_y = [pt[1] for pt in curve_points]
+
+        # Find the axes for this contact
+        ax = None
+        for scatter_id, data in self.contact_node_patches.items():
+            if data.get('group_name') == group_name:
+                scatter = data.get('scatter')
+                if scatter and scatter.axes:
+                    ax = scatter.axes
+                    break
+
+        if not ax:
+            return
+
+        # Remove old preview artists
+        self._clear_bezier_preview()
+
+        # Initialize preview artists list
+        if not hasattr(self, 'bezier_preview_artists'):
+            self.bezier_preview_artists = []
+
+        # Draw new preview line (cyan, dashed)
+        self.bezier_preview_line = ax.plot(
+            curve_x, curve_y,
+            color='cyan', linewidth=3, linestyle='--',
+            alpha=0.8, zorder=20
+        )[0]
+        self.bezier_preview_artists.append(self.bezier_preview_line)
+
+        # Also draw control point lines (handles)
+        handle1 = ax.plot([p0[0], c1[0]], [p0[1], c1[1]],
+               color='orange', linewidth=1.5, linestyle='-', alpha=0.8, zorder=21)[0]
+        handle2 = ax.plot([p1[0], c2[0]], [p1[1], c2[1]],
+               color='orange', linewidth=1.5, linestyle='-', alpha=0.8, zorder=21)[0]
+        self.bezier_preview_artists.extend([handle1, handle2])
+
+        # Draw control points (squares)
+        ctrl_scatter = ax.scatter([c1[0], c2[0]], [c1[1], c2[1]],
+                  c='orange', s=60, marker='s', zorder=22, alpha=0.9, edgecolors='black')
+        self.bezier_preview_artists.append(ctrl_scatter)
+
+        # Draw the drag point (circle)
+        drag_scatter = ax.scatter([mouse_x], [mouse_y],
+                  c='cyan', s=80, marker='o', zorder=23, alpha=0.9, edgecolors='black')
+        self.bezier_preview_artists.append(drag_scatter)
+
+        # Redraw
+        if hasattr(self, 'canvas_sections'):
+            self.canvas_sections.draw_idle()
+
+    def _clear_bezier_preview(self):
+        """Clear all bezier preview artists."""
+        if hasattr(self, 'bezier_preview_artists'):
+            for artist in self.bezier_preview_artists:
+                try:
+                    artist.remove()
+                except:
+                    pass
+            self.bezier_preview_artists = []
+        self.bezier_preview_line = None
 
     def _find_nearest_contact_endpoint(self, x, y):
         """Find the nearest contact endpoint to the given coordinates.
@@ -9121,10 +9437,15 @@ class GeologicalCrossSectionGUI:
         self._update_node_selection_display()
 
     def on_section_hover(self, event):
-        """Handle mouse hover over section display for tooltips."""
+        """Handle mouse hover over section display for tooltips and bezier preview."""
         # Skip hover processing during section scrolling to prevent unwanted selections
         if getattr(self, 'scrolling_sections', False):
             return
+
+        # Handle live bezier curve preview during dragging
+        if self.dragging_bezier_segment and event.xdata and event.ydata:
+            self._update_bezier_preview(event.xdata, event.ydata)
+            return  # Don't show tooltips while dragging
 
         if event.inaxes is None:
             # Mouse left the axes - hide tooltip
