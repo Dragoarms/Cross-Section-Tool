@@ -242,10 +242,10 @@ class GeologicalCrossSectionGUI:
         # 3D display options
         self.display_mode_3d = tk.StringVar(value="wireframe")
 
-        # Buffers for solid meshes built between sections
-        # Each entry in mesh_vertices is [x, y, z]; mesh_faces are [i0, i1, i2] indices
-        self.mesh_vertices = []
-        self.mesh_faces = []
+        # Buffers for solid meshes built between sections - now per-object
+        # self.object_meshes = {formation_name: {'vertices': [[x,y,z],...], 'faces': [[i0,i1,i2],...]}}
+        self.object_meshes = {}
+        self.current_mesh_object = None  # Track which object we're building
 
         self.setup_ui()
 
@@ -3819,7 +3819,7 @@ class GeologicalCrossSectionGUI:
         """Draw sections as transparent meshes."""
         self.draw_3d_solid()  # Same as solid but alpha is already set
 
-    def create_mesh_between_sections(self, section1, section2, alpha=0.7):
+    def create_mesh_between_sections(self, section1, section2, alpha=0.7, object_name=None):
         """Create triangulated mesh between two sections using proper lofting.
 
         This improved version:
@@ -3830,6 +3830,9 @@ class GeologicalCrossSectionGUI:
         - Resamples both outlines by arc length for proper correspondence
         - Minimizes twist by finding optimal starting point offset
         - Records vertices and faces for 3D export
+
+        Args:
+            object_name: Name for this mesh object (formation name)
         """
         try:
             coords1 = section1["coords"]
@@ -3855,24 +3858,36 @@ class GeologicalCrossSectionGUI:
 
             # Loft each matched pair of parts
             for part1, part2 in matched_parts:
-                self._loft_single_part(part1, part2, northing1, northing2, color, alpha)
+                self._loft_single_part(part1, part2, northing1, northing2, color, alpha, object_name=object_name)
 
         except Exception as e:
             logger.error(f"Error creating mesh: {e}")
             # Fallback - use simple connection if something fails
             self.connect_sections_simple(section1, section2, alpha)
 
-    def _loft_single_part(self, coords1, coords2, northing1, northing2, color, alpha=0.7):
-        """Loft a single polygon part between two sections."""
+    def _loft_single_part(self, coords1, coords2, northing1, northing2, color, alpha=0.7, object_name=None):
+        """Loft a single polygon part between two sections.
+
+        Args:
+            object_name: Name for this mesh object (formation name). If None, uses current_mesh_object.
+        """
         # Prepare coordinates and align starting points
         aligned1, aligned2, n_points = self._prepare_loft_profiles(coords1, coords2)
 
         if aligned1 is None or aligned2 is None:
             return
 
-        # Build vertices for both sections
-        base_index = len(self.mesh_vertices)
+        # Determine which object this mesh belongs to
+        mesh_name = object_name or self.current_mesh_object or "Unknown"
 
+        # Initialize object mesh storage if needed
+        if mesh_name not in self.object_meshes:
+            self.object_meshes[mesh_name] = {'vertices': [], 'faces': [], 'color': color}
+
+        obj_mesh = self.object_meshes[mesh_name]
+        base_index = len(obj_mesh['vertices'])
+
+        # Build vertices for both sections
         verts = []
         for i in range(n_points):
             verts.append([aligned1[i, 0], northing1, aligned1[i, 1]])
@@ -3881,9 +3896,9 @@ class GeologicalCrossSectionGUI:
 
         verts = np.asarray(verts)
 
-        # Append to global mesh vertex list
+        # Append to object's vertex list
         for v in verts:
-            self.mesh_vertices.append(v.tolist())
+            obj_mesh['vertices'].append(v.tolist())
 
         # Build faces as a simple strip between the two resampled outlines
         faces = []
@@ -3898,16 +3913,16 @@ class GeologicalCrossSectionGUI:
             faces.append([i1, j1, j0])
 
         # Close the strip: connect last vertex back to first
-        i0 = base_index + n_points - 1  # Last vertex of section 1
-        i1 = base_index + 0              # First vertex of section 1
-        j0 = base_index + n_points - 1 + n_points  # Last vertex of section 2
-        j1 = base_index + n_points       # First vertex of section 2
+        i0 = base_index + n_points - 1
+        i1 = base_index + 0
+        j0 = base_index + n_points - 1 + n_points
+        j1 = base_index + n_points
 
         faces.append([i0, i1, j0])
         faces.append([i1, j1, j0])
 
-        # Append to global mesh face list
-        self.mesh_faces.extend(faces)
+        # Append to object's face list
+        obj_mesh['faces'].extend(faces)
 
         # Plot triangulated surface for visual feedback
         self.ax_3d.plot_trisurf(
@@ -4148,7 +4163,7 @@ class GeologicalCrossSectionGUI:
 
         return matches
 
-    def _add_polygon_end_cap(self, coords, northing, color, flip_normal=False, alpha=0.7):
+    def _add_polygon_end_cap(self, coords, northing, color, flip_normal=False, alpha=0.7, object_name=None):
         """Add an end cap (filled polygon face) to close a solid volume.
 
         Uses fan triangulation from the centroid to create triangular faces.
@@ -4160,10 +4175,20 @@ class GeologicalCrossSectionGUI:
             color: RGB color tuple
             flip_normal: If True, reverse winding for opposite-facing normal
             alpha: Transparency
+            object_name: Name for this mesh object (formation name)
         """
         coords = np.asarray(coords)
         if len(coords) < 3:
             return
+
+        # Determine which object this mesh belongs to
+        mesh_name = object_name or self.current_mesh_object or "Unknown"
+
+        # Initialize object mesh storage if needed
+        if mesh_name not in self.object_meshes:
+            self.object_meshes[mesh_name] = {'vertices': [], 'faces': [], 'color': color}
+
+        obj_mesh = self.object_meshes[mesh_name]
 
         # Split into disconnected parts if needed
         parts = self._split_disconnected_polygons(coords)
@@ -4180,15 +4205,15 @@ class GeologicalCrossSectionGUI:
             centroid = np.mean(part[:-1], axis=0)  # Exclude duplicate closing point
 
             # Build 3D vertices: centroid first, then perimeter points
-            base_index = len(self.mesh_vertices)
+            base_index = len(obj_mesh['vertices'])
 
             # Add centroid vertex
-            self.mesh_vertices.append([centroid[0], northing, centroid[1]])
+            obj_mesh['vertices'].append([centroid[0], northing, centroid[1]])
 
             # Add perimeter vertices
             n_perimeter = len(part) - 1  # Exclude closing point
             for i in range(n_perimeter):
-                self.mesh_vertices.append([part[i, 0], northing, part[i, 1]])
+                obj_mesh['vertices'].append([part[i, 0], northing, part[i, 1]])
 
             # Create fan triangles from centroid to perimeter
             faces = []
@@ -4208,7 +4233,7 @@ class GeologicalCrossSectionGUI:
                         base_index + 1 + next_i,  # Next perimeter point
                     ])
 
-            self.mesh_faces.extend(faces)
+            obj_mesh['faces'].extend(faces)
 
             # Visualize the cap
             verts = np.array([[centroid[0], northing, centroid[1]]] +
@@ -4265,9 +4290,8 @@ class GeologicalCrossSectionGUI:
         # Clear and redraw with only selected formations as solids
         self.ax_3d.clear()
 
-        # Reset mesh buffers that export_3d_model / export_to_obj might use
-        self.mesh_vertices = []
-        self.mesh_faces = []
+        # Reset per-object mesh buffers
+        self.object_meshes = {}
 
         # Group selected units by formation
         selected_formations = {}
@@ -4285,13 +4309,36 @@ class GeologicalCrossSectionGUI:
                 formation = unit.get("formation", "Unknown")
                 selected_formations.setdefault(formation, []).append(unit)
 
+        # Get stratigraphic order (bottom to top = oldest to youngest)
+        # Reverse the strat column order since it's stored young to old
+        strat_order = []
+        try:
+            strat_units = self.strat_column.get_all_units_ordered()
+            # Reverse to get oldest first (bottom to top)
+            strat_order = [u.name for u in reversed(strat_units)]
+        except Exception as e:
+            logger.warning(f"Could not get strat order: {e}")
+
+        # Sort formations by stratigraphic order (bottom to top)
+        def get_strat_position(formation):
+            if formation in strat_order:
+                return strat_order.index(formation)
+            return len(strat_order)  # Unknown formations go last (top)
+
+        sorted_formations = sorted(selected_formations.keys(), key=get_strat_position)
+
         # Parameters controlling connectivity
         max_gap_factor = 2.5       # how many times the median northing spacing we allow
         max_shape_mismatch = 2.0   # how many times the typical unit width we allow
 
-        for formation, units in selected_formations.items():
+        # Build meshes in stratigraphic order (bottom to top)
+        for formation in sorted_formations:
+            units = selected_formations[formation]
             if len(units) < 2:
                 continue
+
+            # Set current mesh object name
+            self.current_mesh_object = formation
 
             # Sort units by northing
             units.sort(key=lambda u: u.get("northing", 0.0))
@@ -4341,7 +4388,7 @@ class GeologicalCrossSectionGUI:
                         "color": u2.get("color", (0.5, 0.5, 0.5)),
                     }
 
-                    self.create_mesh_between_sections(section1, section2, alpha=0.9)
+                    self.create_mesh_between_sections(section1, section2, alpha=0.9, object_name=formation)
 
                 # Add end caps to close the solid volume
                 if len(block) >= 2:
@@ -4357,8 +4404,9 @@ class GeologicalCrossSectionGUI:
                             first_coords,
                             first_unit.get("northing", 0.0),
                             first_unit.get("color", (0.5, 0.5, 0.5)),
-                            flip_normal=True,  # Face outward (toward smaller northing)
-                            alpha=0.9
+                            flip_normal=True,
+                            alpha=0.9,
+                            object_name=formation
                         )
 
                     # Last section cap (back face)
@@ -4373,9 +4421,16 @@ class GeologicalCrossSectionGUI:
                             last_coords,
                             last_unit.get("northing", 0.0),
                             last_unit.get("color", (0.5, 0.5, 0.5)),
-                            flip_normal=False,  # Face outward (toward larger northing)
-                            alpha=0.9
+                            flip_normal=False,
+                            alpha=0.9,
+                            object_name=formation
                         )
+
+        # Draw faults in 3D
+        fault_count = self._draw_3d_faults()
+
+        # Draw contacts in 3D
+        contact_count = self._draw_3d_contacts()
 
         self.ax_3d.set_xlabel("Easting (m)")
         self.ax_3d.set_ylabel("Northing (m)")
@@ -4390,7 +4445,9 @@ class GeologicalCrossSectionGUI:
         self.canvas_3d.draw()
 
         messagebox.showinfo(
-            "Solids Created", f"Created solid meshes for {len(selected_formations)} formations"
+            "Solids Created",
+            f"Created meshes for {len(self.object_meshes)} formations\n"
+            f"Faults: {fault_count}, Contacts: {contact_count}"
         )
 
     def _group_units_by_northing_gap(self, units, factor=2.5):
@@ -4427,6 +4484,87 @@ class GeologicalCrossSectionGUI:
             blocks.append(current)
 
         return blocks
+
+    def _draw_3d_faults(self):
+        """Draw fault lines in 3D view.
+
+        Returns the number of faults drawn.
+        """
+        fault_count = 0
+
+        for (pdf_path, page_num), section_data in self.all_sections_data.items():
+            northing = section_data.get("northing")
+            if northing is None:
+                continue
+
+            for poly_name, polyline in section_data.get("polylines", {}).items():
+                fault_assignment = polyline.get("fault_assignment")
+                is_fault = polyline.get("is_fault", False) or polyline.get("type") == "Fault"
+
+                if not (fault_assignment or is_fault):
+                    continue
+
+                vertices = polyline.get("vertices", [])
+                if len(vertices) < 4:
+                    continue
+
+                # Extract coordinates
+                xs = [vertices[i] for i in range(0, len(vertices), 2)]
+                zs = [vertices[i + 1] for i in range(0, len(vertices), 2) if i + 1 < len(vertices)]
+                ys = [northing] * len(xs)
+
+                # Get fault color
+                if fault_assignment and fault_assignment in self.defined_faults:
+                    color = self.defined_faults[fault_assignment].get('color', 'red')
+                else:
+                    color = 'red'
+
+                # Draw fault line
+                self.ax_3d.plot(
+                    xs, ys, zs,
+                    color=color,
+                    linewidth=2.5,
+                    alpha=0.9,
+                    label=fault_assignment or poly_name if fault_count == 0 else None
+                )
+                fault_count += 1
+
+        return fault_count
+
+    def _draw_3d_contacts(self):
+        """Draw contact lines in 3D view.
+
+        Returns the number of contacts drawn.
+        """
+        contact_count = 0
+
+        # Draw grouped contacts
+        for group_name, group in self.grouped_contacts.items():
+            for contact in group.contacts:
+                northing = contact.get("northing")
+                if northing is None:
+                    continue
+
+                points = contact.get("points", [])
+                if len(points) < 2:
+                    continue
+
+                # Extract coordinates from points
+                xs = [p[0] for p in points]
+                zs = [p[1] for p in points]
+                ys = [northing] * len(xs)
+
+                # Draw contact line
+                self.ax_3d.plot(
+                    xs, ys, zs,
+                    color='black',
+                    linewidth=1.5,
+                    alpha=0.7,
+                    linestyle='--'
+                )
+                contact_count += 1
+
+        return contact_count
 
     def _units_are_compatible(self, u1, u2, max_shape_mismatch_factor=2.0):
         """
@@ -4738,28 +4876,49 @@ class GeologicalCrossSectionGUI:
             messagebox.showinfo("Exported", f"3D model exported to {filepath}")
 
     def export_to_obj(self, filepath):
-        """Export to Wavefront OBJ format.
+        """Export to Wavefront OBJ format with separate objects per formation.
 
-        If solid meshes have been created (mesh_vertices / mesh_faces),
-        export those as a proper 3D body. Otherwise fall back to exporting
-        flat section outlines for the selected units.
+        Each formation is exported as a separate named object/group in the OBJ file.
+        If per-object meshes exist, exports those. Otherwise falls back to
+        flat section outlines for selected units.
         """
         with open(filepath, "w") as f:
             f.write("# Geological 3D Model\n")
             f.write("# Generated by Geological Cross-Section Tool\n\n")
 
-            # Prefer exporting the solid mesh if it exists
-            if self.mesh_vertices and self.mesh_faces:
-                # Write vertices
-                for vx, vy, vz in self.mesh_vertices:
-                    f.write(f"v {vx:.4f} {vy:.4f} {vz:.4f}\n")
+            # Export per-object meshes if they exist
+            if self.object_meshes:
+                global_vertex_offset = 0
 
-                f.write("\n")
+                for obj_name, mesh_data in self.object_meshes.items():
+                    vertices = mesh_data.get('vertices', [])
+                    faces = mesh_data.get('faces', [])
+                    color = mesh_data.get('color', (0.5, 0.5, 0.5))
 
-                # Faces in OBJ are 1-based indices
-                for i0, i1, i2 in self.mesh_faces:
-                    f.write(f"f {i0 + 1} {i1 + 1} {i2 + 1}\n")
+                    if not vertices or not faces:
+                        continue
 
+                    # Sanitize object name for OBJ (no spaces, special chars)
+                    safe_name = obj_name.replace(' ', '_').replace('-', '_').replace('/', '_')
+
+                    # Write object/group header
+                    f.write(f"\n# Object: {obj_name}\n")
+                    f.write(f"o {safe_name}\n")
+                    f.write(f"g {safe_name}\n")
+
+                    # Write vertices
+                    for vx, vy, vz in vertices:
+                        f.write(f"v {vx:.4f} {vy:.4f} {vz:.4f}\n")
+
+                    f.write("\n")
+
+                    # Write faces (adjust indices for global offset, OBJ is 1-based)
+                    for i0, i1, i2 in faces:
+                        f.write(f"f {i0 + global_vertex_offset + 1} {i1 + global_vertex_offset + 1} {i2 + global_vertex_offset + 1}\n")
+
+                    global_vertex_offset += len(vertices)
+
+                logger.info(f"Exported {len(self.object_meshes)} objects to OBJ")
                 return
 
             # Fallback: export each selected unit as a flat polygon at its northing
