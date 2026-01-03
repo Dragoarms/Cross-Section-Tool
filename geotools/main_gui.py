@@ -4426,11 +4426,11 @@ class GeologicalCrossSectionGUI:
                             object_name=formation
                         )
 
-        # Draw faults in 3D
-        fault_count = self._draw_3d_faults()
+        # Create fault surfaces (lofted meshes)
+        fault_surface_count = self._create_fault_surfaces()
 
-        # Draw contacts in 3D
-        contact_count = self._draw_3d_contacts()
+        # Create contact surfaces (lofted meshes)
+        contact_surface_count = self._create_contact_surfaces()
 
         self.ax_3d.set_xlabel("Easting (m)")
         self.ax_3d.set_ylabel("Northing (m)")
@@ -4446,8 +4446,9 @@ class GeologicalCrossSectionGUI:
 
         messagebox.showinfo(
             "Solids Created",
-            f"Created meshes for {len(self.object_meshes)} formations\n"
-            f"Faults: {fault_count}, Contacts: {contact_count}"
+            f"Created meshes for {len(self.object_meshes)} objects\n"
+            f"Fault surfaces: {fault_surface_count}\n"
+            f"Contact surfaces: {contact_surface_count}"
         )
 
     def _group_units_by_northing_gap(self, units, factor=2.5):
@@ -4538,20 +4539,18 @@ class GeologicalCrossSectionGUI:
         """
         contact_count = 0
 
-        # Draw grouped contacts
+        # Draw grouped contacts using polylines (not contacts)
         for group_name, group in self.grouped_contacts.items():
-            for contact in group.contacts:
-                northing = contact.get("northing")
-                if northing is None:
-                    continue
+            for polyline in group.polylines:
+                northing = polyline.northing
+                coords = polyline.get_coords()
 
-                points = contact.get("points", [])
-                if len(points) < 2:
+                if len(coords) < 2:
                     continue
 
                 # Extract coordinates from points
-                xs = [p[0] for p in points]
-                zs = [p[1] for p in points]
+                xs = [p[0] for p in coords]
+                zs = [p[1] for p in coords]
                 ys = [northing] * len(xs)
 
                 # Draw contact line
@@ -4565,6 +4564,351 @@ class GeologicalCrossSectionGUI:
                 contact_count += 1
 
         return contact_count
+
+    def _resample_polyline_arc_length(self, coords, n_samples):
+        """Resample an open polyline to n_samples points at uniform arc length.
+
+        Unlike the polygon version, this includes both endpoints.
+        """
+        coords = np.asarray(coords)
+        if len(coords) < 2:
+            return coords
+
+        # Calculate cumulative arc length
+        deltas = np.diff(coords, axis=0)
+        seg_lengths = np.sqrt(deltas[:, 0]**2 + deltas[:, 1]**2)
+        cum_len = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+        total_len = cum_len[-1]
+
+        if total_len < 1e-10:
+            return np.tile(coords[0], (n_samples, 1))
+
+        # Normalize to 0-1
+        t_orig = cum_len / total_len
+
+        # Target uniform samples including both endpoints
+        t_target = np.linspace(0.0, 1.0, n_samples, endpoint=True)
+
+        # Interpolate x and y separately
+        x_interp = np.interp(t_target, t_orig, coords[:, 0])
+        y_interp = np.interp(t_target, t_orig, coords[:, 1])
+
+        return np.column_stack([x_interp, y_interp])
+
+    def _align_polyline_direction(self, reference, target):
+        """Ensure target polyline runs in same direction as reference.
+
+        Compares start/end points and reverses if needed.
+        """
+        ref_start = reference[0]
+        ref_end = reference[-1]
+        tgt_start = target[0]
+        tgt_end = target[-1]
+
+        # Check if target runs in opposite direction
+        dist_same = np.linalg.norm(ref_start - tgt_start) + np.linalg.norm(ref_end - tgt_end)
+        dist_reversed = np.linalg.norm(ref_start - tgt_end) + np.linalg.norm(ref_end - tgt_start)
+
+        if dist_reversed < dist_same:
+            return target[::-1]
+        return target
+
+    def _loft_open_polyline(self, coords1, coords2, northing1, northing2, color, alpha=0.7, object_name=None, n_samples=32):
+        """Loft between two open polylines to create a surface strip.
+
+        Unlike closed polygon lofting, this does NOT wrap around at the ends.
+        """
+        coords1 = np.asarray(coords1)
+        coords2 = np.asarray(coords2)
+
+        if len(coords1) < 2 or len(coords2) < 2:
+            return
+
+        # Resample both polylines to same number of points
+        resampled1 = self._resample_polyline_arc_length(coords1, n_samples)
+        resampled2 = self._resample_polyline_arc_length(coords2, n_samples)
+
+        # Ensure polylines run in same direction
+        resampled2 = self._align_polyline_direction(resampled1, resampled2)
+
+        # Determine which object this mesh belongs to
+        mesh_name = object_name or "Surface"
+
+        # Initialize object mesh storage if needed
+        if mesh_name not in self.object_meshes:
+            self.object_meshes[mesh_name] = {'vertices': [], 'faces': [], 'color': color}
+
+        obj_mesh = self.object_meshes[mesh_name]
+        base_index = len(obj_mesh['vertices'])
+
+        # Build vertices for both sections
+        verts = []
+        for i in range(n_samples):
+            verts.append([resampled1[i, 0], northing1, resampled1[i, 1]])
+        for i in range(n_samples):
+            verts.append([resampled2[i, 0], northing2, resampled2[i, 1]])
+
+        verts = np.asarray(verts)
+
+        # Append to object's vertex list
+        for v in verts:
+            obj_mesh['vertices'].append(v.tolist())
+
+        # Build faces as a strip between the two polylines (no wrap-around)
+        faces = []
+        for i in range(n_samples - 1):
+            i0 = base_index + i
+            i1 = base_index + i + 1
+            j0 = base_index + i + n_samples
+            j1 = base_index + i + n_samples + 1
+
+            faces.append([i0, i1, j0])
+            faces.append([i1, j1, j0])
+
+        # Append to object's face list
+        obj_mesh['faces'].extend(faces)
+
+        # Plot triangulated surface for visual feedback
+        if len(faces) > 0:
+            self.ax_3d.plot_trisurf(
+                verts[:, 0],
+                verts[:, 1],
+                verts[:, 2],
+                triangles=np.array([[f[0] - base_index, f[1] - base_index, f[2] - base_index] for f in faces]),
+                color=color,
+                alpha=alpha,
+                edgecolor="none",
+                shade=True,
+            )
+
+    def _match_open_polylines(self, polylines1, polylines2):
+        """Match open polylines between two sections by spatial proximity.
+
+        Uses centroid-based matching to pair polylines from adjacent sections.
+        Returns list of (polyline1, polyline2) tuples.
+        """
+        if not polylines1 or not polylines2:
+            return []
+
+        # Calculate centroid for each polyline
+        def get_centroid(coords):
+            coords = np.asarray(coords)
+            return np.mean(coords, axis=0)
+
+        centroids1 = [get_centroid(p) for p in polylines1]
+        centroids2 = [get_centroid(p) for p in polylines2]
+
+        matches = []
+        used2 = set()
+
+        for i, c1 in enumerate(centroids1):
+            best_j = None
+            best_dist = float('inf')
+
+            for j, c2 in enumerate(centroids2):
+                if j in used2:
+                    continue
+                dist = np.linalg.norm(c1 - c2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_j = j
+
+            if best_j is not None:
+                matches.append((polylines1[i], polylines2[best_j]))
+                used2.add(best_j)
+
+        return matches
+
+    def _split_open_polylines(self, coords, gap_factor=5.0):
+        """Split an open polyline into multiple parts if there are large gaps.
+
+        Similar to _split_disconnected_polygons but for open polylines.
+        """
+        coords = np.asarray(coords)
+        if len(coords) < 2:
+            return [coords]
+
+        # Calculate segment lengths
+        deltas = np.diff(coords, axis=0)
+        seg_lengths = np.sqrt(deltas[:, 0]**2 + deltas[:, 1]**2)
+
+        if len(seg_lengths) == 0:
+            return [coords]
+
+        # Calculate characteristic size
+        x_range = np.ptp(coords[:, 0])
+        y_range = np.ptp(coords[:, 1])
+        bbox_diagonal = np.sqrt(x_range**2 + y_range**2)
+
+        if bbox_diagonal < 1e-10:
+            return [coords]
+
+        percentile_95 = np.percentile(seg_lengths, 95)
+        threshold = max(gap_factor * percentile_95, 0.5 * bbox_diagonal)
+
+        gap_indices = np.where(seg_lengths > threshold)[0]
+
+        if len(gap_indices) == 0:
+            return [coords]
+
+        # Split at gap indices
+        parts = []
+        start_idx = 0
+
+        for gap_idx in gap_indices:
+            part = coords[start_idx:gap_idx + 1]
+            if len(part) >= 2:
+                parts.append(part)
+            start_idx = gap_idx + 1
+
+        # Add final part
+        if start_idx < len(coords):
+            part = coords[start_idx:]
+            if len(part) >= 2:
+                parts.append(part)
+
+        return parts if parts else [coords]
+
+    def _create_fault_surfaces(self):
+        """Create surface meshes for all faults by lofting between sections.
+
+        Returns the number of fault surfaces created.
+        """
+        # Group fault polylines by fault assignment
+        fault_groups = {}  # {fault_name: [(northing, coords), ...]}
+
+        for (pdf_path, page_num), section_data in self.all_sections_data.items():
+            northing = section_data.get("northing")
+            if northing is None:
+                continue
+
+            for poly_name, polyline in section_data.get("polylines", {}).items():
+                fault_assignment = polyline.get("fault_assignment")
+                is_fault = polyline.get("is_fault", False) or polyline.get("type") == "Fault"
+
+                if not (fault_assignment or is_fault):
+                    continue
+
+                vertices = polyline.get("vertices", [])
+                if len(vertices) < 4:
+                    continue
+
+                # Extract coordinates as list of (x, y) tuples
+                coords = []
+                for i in range(0, len(vertices), 2):
+                    if i + 1 < len(vertices):
+                        coords.append([vertices[i], vertices[i + 1]])
+
+                if len(coords) < 2:
+                    continue
+
+                # Use fault_assignment or generate a unique name
+                fault_name = fault_assignment or f"Fault_{poly_name}"
+
+                if fault_name not in fault_groups:
+                    fault_groups[fault_name] = []
+                fault_groups[fault_name].append((northing, coords))
+
+        # Create surfaces for each fault group
+        surface_count = 0
+
+        for fault_name, fault_sections in fault_groups.items():
+            # Sort by northing
+            fault_sections.sort(key=lambda x: x[0])
+
+            if len(fault_sections) < 2:
+                continue
+
+            # Get fault color
+            if fault_name in self.defined_faults:
+                color = self.defined_faults[fault_name].get('color', 'red')
+                # Convert hex to RGB if needed
+                if isinstance(color, str) and color.startswith('#'):
+                    color = tuple(int(color[i:i+2], 16)/255 for i in (1, 3, 5))
+            else:
+                color = (0.8, 0.2, 0.2)  # Default red
+
+            # Loft between adjacent sections
+            for i in range(len(fault_sections) - 1):
+                northing1, coords1 = fault_sections[i]
+                northing2, coords2 = fault_sections[i + 1]
+
+                # Split into parts if there are gaps
+                parts1 = self._split_open_polylines(np.array(coords1))
+                parts2 = self._split_open_polylines(np.array(coords2))
+
+                # Match parts between sections
+                matched = self._match_open_polylines(parts1, parts2)
+
+                for part1, part2 in matched:
+                    self._loft_open_polyline(
+                        part1, part2, northing1, northing2,
+                        color=color, alpha=0.8,
+                        object_name=f"Fault_{fault_name}"
+                    )
+                    surface_count += 1
+
+        return surface_count
+
+    def _create_contact_surfaces(self):
+        """Create surface meshes for all contacts by lofting between sections.
+
+        Returns the number of contact surfaces created.
+        """
+        surface_count = 0
+
+        for group_name, group in self.grouped_contacts.items():
+            # Group polylines by northing
+            sections = group.get_sections()
+            if len(sections) < 2:
+                continue
+
+            # Get polylines for each section
+            section_polylines = {}
+            for northing in sections:
+                polylines = group.get_polylines_for_section(northing)
+                if polylines:
+                    section_polylines[northing] = [
+                        np.array(p.get_coords()) for p in polylines
+                    ]
+
+            sorted_northings = sorted(section_polylines.keys())
+            if len(sorted_northings) < 2:
+                continue
+
+            # Loft between adjacent sections
+            for i in range(len(sorted_northings) - 1):
+                n1 = sorted_northings[i]
+                n2 = sorted_northings[i + 1]
+
+                polylines1 = section_polylines.get(n1, [])
+                polylines2 = section_polylines.get(n2, [])
+
+                if not polylines1 or not polylines2:
+                    continue
+
+                # Split each polyline into parts if there are gaps
+                all_parts1 = []
+                for pl in polylines1:
+                    all_parts1.extend(self._split_open_polylines(pl))
+
+                all_parts2 = []
+                for pl in polylines2:
+                    all_parts2.extend(self._split_open_polylines(pl))
+
+                # Match parts between sections
+                matched = self._match_open_polylines(all_parts1, all_parts2)
+
+                for part1, part2 in matched:
+                    self._loft_open_polyline(
+                        part1, part2, n1, n2,
+                        color=(0.3, 0.3, 0.3),  # Gray for contacts
+                        alpha=0.6,
+                        object_name=f"Contact_{group_name}"
+                    )
+                    surface_count += 1
+
+        return surface_count
 
     def _units_are_compatible(self, u1, u2, max_shape_mismatch_factor=2.0):
         """
@@ -4860,7 +5204,12 @@ class GeologicalCrossSectionGUI:
         """Export 3D model to file."""
         filepath = filedialog.asksaveasfilename(
             defaultextension=".obj",
-            filetypes=[("Wavefront OBJ", "*.obj"), ("STL file", "*.stl"), ("PLY file", "*.ply")],
+            filetypes=[
+                ("Wavefront OBJ", "*.obj"),
+                ("STL file", "*.stl"),
+                ("PLY file", "*.ply"),
+                ("DXF Key Points", "*.dxf"),
+            ],
         )
 
         if filepath:
@@ -4872,6 +5221,8 @@ class GeologicalCrossSectionGUI:
                 self.export_to_stl(filepath)
             elif ext == ".ply":
                 self.export_to_ply(filepath)
+            elif ext == ".dxf":
+                self.export_key_points_to_dxf(filepath)
 
             messagebox.showinfo("Exported", f"3D model exported to {filepath}")
 
@@ -4944,7 +5295,92 @@ class GeologicalCrossSectionGUI:
                             f.write(f" {vertex_count - n_verts + i + 1}")
                         f.write("\n\n")
 
+    def export_key_points_to_dxf(self, filepath):
+        """Export key mesh vertices to DXF format for Leapfrog editing.
 
+        Exports control points for each object as 3D polylines organized by layer.
+        Each object (formation, fault, contact) gets its own layer.
+        Points can be used in Leapfrog to add bezier control lines or edit surfaces.
+        """
+        if not self.object_meshes:
+            logger.warning("No mesh objects to export")
+            return
+
+        with open(filepath, "w") as f:
+            # DXF header
+            f.write("0\nSECTION\n2\nENTITIES\n")
+
+            for obj_name, mesh_data in self.object_meshes.items():
+                vertices = mesh_data.get('vertices', [])
+                if not vertices:
+                    continue
+
+                # Sanitize layer name
+                layer_name = obj_name.replace(' ', '_').replace('-', '_').replace('/', '_')
+
+                # Group vertices by northing (Y coordinate) to create section polylines
+                vertices_by_northing = {}
+                for vx, vy, vz in vertices:
+                    # Round northing to group nearby points
+                    northing_key = round(vy, 1)
+                    if northing_key not in vertices_by_northing:
+                        vertices_by_northing[northing_key] = []
+                    vertices_by_northing[northing_key].append((vx, vy, vz))
+
+                # Write each section as a polyline
+                for northing, section_verts in sorted(vertices_by_northing.items()):
+                    if len(section_verts) < 2:
+                        continue
+
+                    # Sort vertices by easting (X) for consistent ordering
+                    section_verts.sort(key=lambda v: v[0])
+
+                    # Remove duplicates while preserving order
+                    unique_verts = []
+                    seen = set()
+                    for v in section_verts:
+                        key = (round(v[0], 2), round(v[1], 2), round(v[2], 2))
+                        if key not in seen:
+                            seen.add(key)
+                            unique_verts.append(v)
+
+                    if len(unique_verts) < 2:
+                        continue
+
+                    # Write as 3D polyline
+                    section_layer = f"{layer_name}_{int(northing)}"
+                    f.write("0\nPOLYLINE\n")
+                    f.write(f"8\n{section_layer}\n")
+                    f.write("66\n1\n")  # Vertices follow
+                    f.write("70\n8\n")  # 3D polyline flag
+
+                    for x, y, z in unique_verts:
+                        f.write("0\nVERTEX\n")
+                        f.write(f"8\n{section_layer}\n")
+                        f.write(f"10\n{x:.2f}\n")  # X = Easting
+                        f.write(f"20\n{y:.2f}\n")  # Y = Northing
+                        f.write(f"30\n{z:.2f}\n")  # Z = RL
+
+                    f.write("0\nSEQEND\n")
+
+            # Also export individual points for each mesh vertex
+            for obj_name, mesh_data in self.object_meshes.items():
+                vertices = mesh_data.get('vertices', [])
+                if not vertices:
+                    continue
+
+                layer_name = f"{obj_name.replace(' ', '_').replace('-', '_').replace('/', '_')}_POINTS"
+
+                for vx, vy, vz in vertices:
+                    f.write("0\nPOINT\n")
+                    f.write(f"8\n{layer_name}\n")
+                    f.write(f"10\n{vx:.2f}\n")
+                    f.write(f"20\n{vy:.2f}\n")
+                    f.write(f"30\n{vz:.2f}\n")
+
+            f.write("0\nENDSEC\n0\nEOF\n")
+
+        logger.info(f"Exported key points for {len(self.object_meshes)} objects to DXF")
 
     def export_to_stl(self, filepath):
         """Export to STL format (simplified ASCII STL)."""
