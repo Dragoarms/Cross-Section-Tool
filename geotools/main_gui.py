@@ -233,7 +233,7 @@ class GeologicalCrossSectionGUI:
 
         # Model boundaries for each section
         self.model_boundaries = {}  # {northing: ModelBoundary}
-        self.show_boundaries_var = tk.BooleanVar(value=True)  # Show model boundary lines
+        self.show_boundaries_var = tk.BooleanVar(value=False)  # Disabled - boundaries expand view too much
 
         # Pan/drag state
         self.pan_active = False
@@ -918,13 +918,15 @@ class GeologicalCrossSectionGUI:
                     unit_assignments[unit_name] = unit_data["unit_assignment"]
             
             # Use new contact extractor (with model boundaries for clean termination)
+            # NOTE: Using higher simplify_tolerance (10.0) to reduce node count significantly
+            # while preserving shape. This makes contacts easier to edit in Leapfrog.
             self.grouped_contacts = extract_contacts_grouped(
                 all_sections_data=self.all_sections_data,
                 unit_assignments=unit_assignments,
-                sample_distance=2.0,
+                sample_distance=5.0,       # Increased from 2.0 to reduce initial density
                 proximity_threshold=10.0,
-                min_contact_length=5.0,
-                simplify_tolerance=1.0,
+                min_contact_length=10.0,   # Increased from 5.0 to filter tiny fragments
+                simplify_tolerance=10.0,   # Increased from 1.0 to significantly reduce nodes
                 model_boundaries=self.model_boundaries
             )
             
@@ -2749,21 +2751,10 @@ class GeologicalCrossSectionGUI:
 
                     # Extract model boundary using coord_system bounds (more accurate than path detection)
                     if transform and coord_system:
-                        try:
-                            section_northing_val = coord_system.get("northing", 0.0)
-                            transform_func = lambda x, y: (transform(x, y)[0], transform(x, y)[2])  # (easting, rl)
-                            model_boundary = create_model_boundary_from_coord_system(
-                                coord_system=coord_system,
-                                page=page,
-                                transform_func=transform_func,
-                                northing=section_northing_val,
-                                section_key=(pdf_path, page_num)
-                            )
-                            if model_boundary:
-                                self.model_boundaries[section_northing_val] = model_boundary
-                                logger.debug(f"Extracted model boundary for section N={section_northing_val}")
-                        except Exception as e:
-                            logger.debug(f"Could not extract model boundary: {e}")
+                        # Model boundary extraction disabled - was expanding view extents unnecessarily
+                        # The coordinate system easting/rl bounds are much larger than actual content
+                        # and cause the view to zoom out too far
+                        pass
 
                     # Process units
                     page_units = {}
@@ -2940,31 +2931,17 @@ class GeologicalCrossSectionGUI:
 
     # Part 6: Section Viewer Methods
     def calculate_global_ranges(self):
-        """Calculate the global min/max for eastings and RLs across all sections."""
-        self.global_easting_min = float("inf")
-        self.global_easting_max = float("-inf")
-        self.global_rl_min = float("inf")
-        self.global_rl_max = float("-inf")
+        """Calculate the global min/max for eastings and RLs across all sections.
 
+        Uses ONLY actual feature bounds (units + polylines), NOT coord_system bounds
+        which are much larger and cause the view to zoom out too far.
+        """
         self.content_easting_min = float("inf")
         self.content_easting_max = float("-inf")
         self.content_rl_min = float("inf")
         self.content_rl_max = float("-inf")
 
         for (pdf, page), section_data in self.all_sections_data.items():
-            easting_min = section_data.get("easting_min")
-            easting_max = section_data.get("easting_max")
-            rl_min = section_data.get("rl_min")
-            rl_max = section_data.get("rl_max")
-
-            if easting_min is not None and easting_max is not None:
-                self.global_easting_min = min(self.global_easting_min, easting_min)
-                self.global_easting_max = max(self.global_easting_max, easting_max)
-
-            if rl_min is not None and rl_max is not None:
-                self.global_rl_min = min(self.global_rl_min, rl_min)
-                self.global_rl_max = max(self.global_rl_max, rl_max)
-
             # Check actual unit vertices
             for unit_name, unit in section_data.get("units", {}).items():
                 vertices = unit.get("vertices", [])
@@ -2978,12 +2955,33 @@ class GeologicalCrossSectionGUI:
                             self.content_rl_min = min(self.content_rl_min, rl)
                             self.content_rl_max = max(self.content_rl_max, rl)
 
-        # Add margins
-        if self.global_easting_min != float("inf"):
-            self.global_easting_min -= 100
-            self.global_easting_max += 100
-            self.global_rl_min -= 50
-            self.global_rl_max += 50
+            # Also check polyline vertices (faults, contacts)
+            for poly_name, polyline in section_data.get("polylines", {}).items():
+                vertices = polyline.get("vertices", [])
+                for j in range(0, len(vertices), 2):
+                    if j + 1 < len(vertices):
+                        easting = vertices[j]
+                        rl = vertices[j + 1]
+                        if easting > 10000:  # Real-world coordinates
+                            self.content_easting_min = min(self.content_easting_min, easting)
+                            self.content_easting_max = max(self.content_easting_max, easting)
+                            self.content_rl_min = min(self.content_rl_min, rl)
+                            self.content_rl_max = max(self.content_rl_max, rl)
+
+        # Set global ranges to content ranges (no longer using coord_system bounds)
+        self.global_easting_min = self.content_easting_min
+        self.global_easting_max = self.content_easting_max
+        self.global_rl_min = self.content_rl_min
+        self.global_rl_max = self.content_rl_max
+
+        # Add margins to content bounds
+        if self.content_easting_min != float("inf"):
+            margin_e = (self.content_easting_max - self.content_easting_min) * 0.05
+            margin_rl = (self.content_rl_max - self.content_rl_min) * 0.05
+            self.global_easting_min -= max(margin_e, 50)
+            self.global_easting_max += max(margin_e, 50)
+            self.global_rl_min -= max(margin_rl, 25)
+            self.global_rl_max += max(margin_rl, 25)
 
         # Update northings list
         self.northings = sorted(
@@ -3230,15 +3228,46 @@ class GeologicalCrossSectionGUI:
                     is_fault = polyline.get("is_fault", False) or polyline.get("type") == "Fault"
                     is_line_assigned = polyline.get("is_assigned", True)  # Default True for backward compat
 
-                    if fault_assignment or is_fault:
-                        if fault_assignment and fault_assignment in self.defined_faults:
-                            color = self.defined_faults[fault_assignment].get('color', 'red')
-                        else:
-                            color = polyline.get("color", "red") if is_fault else "red"
-                        linewidth = 3.5  # Thicker for visibility
+                    # Check if this polyline is selected
+                    is_selected = poly_name in self.selected_polylines
+
+                    # Get classification mode
+                    mode = getattr(self, 'classification_mode', 'none')
+
+                    if is_selected and mode == 'fault':
+                        # SELECTED fault in fault mode - bright yellow/gold highlight
+                        color = '#FFD700'  # Gold
+                        linewidth = 5.0  # Very thick
                         linestyle = "-"
-                        zorder = 10  # Higher z-order to appear on top
+                        zorder = 15  # On top of everything
                         line_alpha = 1.0
+                    elif fault_assignment or is_fault:
+                        # Determine if this fault is actually assigned to a defined fault
+                        is_assigned_to_fault = fault_assignment and fault_assignment in self.defined_faults
+
+                        if is_assigned_to_fault:
+                            base_color = self.defined_faults[fault_assignment].get('color', 'red')
+                        else:
+                            base_color = polyline.get("color", "red") if is_fault else "red"
+
+                        if mode == 'fault':
+                            # In fault mode - only mute UNASSIGNED faults
+                            if is_assigned_to_fault:
+                                # Assigned fault - show at full opacity with its color
+                                color = base_color
+                                linewidth = 3.5
+                                line_alpha = 1.0
+                            else:
+                                # Unassigned fault - muted so user can see what needs work
+                                color = base_color
+                                linewidth = 2.5
+                                line_alpha = 0.5
+                        else:
+                            color = base_color
+                            linewidth = 3.5
+                            line_alpha = 1.0
+                        linestyle = "-"
+                        zorder = 10
                     elif not is_line_assigned:
                         # Unassigned polyline - show with 50% transparency and dashed
                         color = polyline.get("color", "#888888")
@@ -3253,8 +3282,7 @@ class GeologicalCrossSectionGUI:
                         zorder = 9
                         line_alpha = 0.8
 
-                    # Apply transparency based on classification mode
-                    mode = getattr(self, 'classification_mode', 'none')
+                    # Apply de-emphasis based on classification mode
                     if mode == 'polygon' or mode == 'contact':
                         # In polygon/contact mode, faults are de-emphasized
                         line_alpha = 0.25
@@ -5189,30 +5217,364 @@ class GeologicalCrossSectionGUI:
         self.canvas_3d.draw()
 
     def export_3d_model(self):
-        """Export 3D model to file."""
-        filepath = filedialog.asksaveasfilename(
-            defaultextension=".obj",
-            filetypes=[
-                ("Wavefront OBJ", "*.obj"),
-                ("STL file", "*.stl"),
-                ("PLY file", "*.ply"),
-                ("DXF Key Points", "*.dxf"),
-            ],
-        )
+        """Export 3D model to file - creates SEPARATE files per object."""
+        # Ask user what format and whether to combine or separate
+        export_dialog = tk.Toplevel(self.root)
+        export_dialog.title("Export 3D Model")
+        export_dialog.geometry("400x300")
+        export_dialog.transient(self.root)
+        export_dialog.grab_set()
 
-        if filepath:
-            ext = Path(filepath).suffix.lower()
+        ttk.Label(export_dialog, text="Export Format:", font=("Arial", 10, "bold")).pack(pady=5)
 
-            if ext == ".obj":
-                self.export_to_obj(filepath)
-            elif ext == ".stl":
-                self.export_to_stl(filepath)
-            elif ext == ".ply":
-                self.export_to_ply(filepath)
-            elif ext == ".dxf":
-                self.export_key_points_to_dxf(filepath)
+        format_var = tk.StringVar(value="obj")
+        formats = [
+            ("Wavefront OBJ (.obj)", "obj"),
+            ("DXF Polylines (.dxf)", "dxf"),
+            ("DXF Splines (.dxf) - smoother curves", "dxf_spline"),
+            ("STL Mesh (.stl)", "stl"),
+        ]
+        for text, val in formats:
+            ttk.Radiobutton(export_dialog, text=text, variable=format_var, value=val).pack(anchor=tk.W, padx=20)
 
-            messagebox.showinfo("Exported", f"3D model exported to {filepath}")
+        ttk.Separator(export_dialog, orient="horizontal").pack(fill=tk.X, pady=10)
+
+        ttk.Label(export_dialog, text="Export Mode:", font=("Arial", 10, "bold")).pack(pady=5)
+
+        mode_var = tk.StringVar(value="separate")
+        ttk.Radiobutton(export_dialog, text="Separate files per object (recommended for Leapfrog)",
+                       variable=mode_var, value="separate").pack(anchor=tk.W, padx=20)
+        ttk.Radiobutton(export_dialog, text="Combined single file",
+                       variable=mode_var, value="combined").pack(anchor=tk.W, padx=20)
+
+        result = {"proceed": False}
+
+        def do_export():
+            result["proceed"] = True
+            result["format"] = format_var.get()
+            result["mode"] = mode_var.get()
+            export_dialog.destroy()
+
+        def cancel():
+            export_dialog.destroy()
+
+        btn_frame = ttk.Frame(export_dialog)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="Export", command=do_export, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=cancel, width=12).pack(side=tk.LEFT, padx=5)
+
+        export_dialog.wait_window()
+
+        if not result.get("proceed"):
+            return
+
+        fmt = result.get("format", "obj")
+        mode = result.get("mode", "separate")
+
+        if mode == "separate":
+            # Ask for output directory
+            output_dir = filedialog.askdirectory(title="Select Output Directory for Separate Files")
+            if not output_dir:
+                return
+            self._export_separate_files(output_dir, fmt)
+        else:
+            # Combined file export
+            ext_map = {"obj": ".obj", "dxf": ".dxf", "dxf_spline": ".dxf", "stl": ".stl"}
+            filepath = filedialog.asksaveasfilename(
+                defaultextension=ext_map.get(fmt, ".obj"),
+                filetypes=[("All files", "*.*")],
+            )
+            if filepath:
+                if fmt == "obj":
+                    self.export_to_obj(filepath)
+                elif fmt == "stl":
+                    self.export_to_stl(filepath)
+                elif fmt == "dxf":
+                    self.export_key_points_to_dxf(filepath)
+                elif fmt == "dxf_spline":
+                    self.export_splines_to_dxf(filepath)
+                messagebox.showinfo("Exported", f"3D model exported to {filepath}")
+
+    def _export_separate_files(self, output_dir, fmt):
+        """Export each object to a separate file."""
+        import os
+        output_path = Path(output_dir)
+
+        if not self.object_meshes:
+            messagebox.showwarning("No Data", "No mesh objects to export. Generate 3D solids first.")
+            return
+
+        exported_count = 0
+        ext_map = {"obj": ".obj", "dxf": ".dxf", "dxf_spline": ".dxf", "stl": ".stl"}
+        ext = ext_map.get(fmt, ".obj")
+
+        for obj_name, mesh_data in self.object_meshes.items():
+            vertices = mesh_data.get('vertices', [])
+            faces = mesh_data.get('faces', [])
+
+            if not vertices:
+                continue
+
+            # Create safe filename
+            safe_name = obj_name.replace(' ', '_').replace('-', '_').replace('/', '_').replace('\\', '_')
+            filepath = output_path / f"{safe_name}{ext}"
+
+            if fmt == "obj":
+                self._export_single_obj(filepath, obj_name, mesh_data)
+            elif fmt == "dxf":
+                self._export_single_dxf(filepath, obj_name, mesh_data)
+            elif fmt == "dxf_spline":
+                self._export_single_dxf_spline(filepath, obj_name, mesh_data)
+            elif fmt == "stl":
+                self._export_single_stl(filepath, obj_name, mesh_data)
+
+            exported_count += 1
+
+        messagebox.showinfo("Export Complete",
+                          f"Exported {exported_count} objects to:\n{output_dir}")
+
+    def _export_single_obj(self, filepath, obj_name, mesh_data):
+        """Export a single object to OBJ format."""
+        vertices = mesh_data.get('vertices', [])
+        faces = mesh_data.get('faces', [])
+
+        with open(filepath, 'w') as f:
+            f.write(f"# {obj_name}\n")
+            f.write(f"o {obj_name.replace(' ', '_')}\n\n")
+
+            # Write vertices
+            for v in vertices:
+                f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n")
+
+            f.write("\n")
+
+            # Write faces (1-indexed)
+            for face in faces:
+                f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
+
+    def _export_single_dxf(self, filepath, obj_name, mesh_data):
+        """Export a single object to DXF format as polylines."""
+        vertices = mesh_data.get('vertices', [])
+
+        if not vertices:
+            return
+
+        with open(filepath, 'w') as f:
+            f.write("0\nSECTION\n2\nENTITIES\n")
+
+            # Group vertices by northing (Y coordinate)
+            vertices_by_northing = {}
+            for vx, vy, vz in vertices:
+                northing_key = round(vy, 1)
+                if northing_key not in vertices_by_northing:
+                    vertices_by_northing[northing_key] = []
+                vertices_by_northing[northing_key].append((vx, vy, vz))
+
+            layer_name = obj_name.replace(' ', '_').replace('-', '_')
+
+            for northing, section_verts in sorted(vertices_by_northing.items()):
+                if len(section_verts) < 2:
+                    continue
+
+                # Sort by easting and remove duplicates
+                section_verts.sort(key=lambda v: v[0])
+                unique_verts = []
+                seen = set()
+                for v in section_verts:
+                    key = (round(v[0], 1), round(v[1], 1), round(v[2], 1))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_verts.append(v)
+
+                if len(unique_verts) < 2:
+                    continue
+
+                # Write 3D polyline
+                f.write("0\nPOLYLINE\n")
+                f.write(f"8\n{layer_name}\n")
+                f.write("66\n1\n70\n8\n")
+
+                for x, y, z in unique_verts:
+                    f.write("0\nVERTEX\n")
+                    f.write(f"8\n{layer_name}\n")
+                    f.write(f"10\n{x:.2f}\n20\n{y:.2f}\n30\n{z:.2f}\n")
+
+                f.write("0\nSEQEND\n")
+
+            f.write("0\nENDSEC\n0\nEOF\n")
+
+    def _export_single_dxf_spline(self, filepath, obj_name, mesh_data):
+        """Export a single object to DXF format as splines (smoother curves)."""
+        vertices = mesh_data.get('vertices', [])
+
+        if not vertices:
+            return
+
+        with open(filepath, 'w') as f:
+            f.write("0\nSECTION\n2\nENTITIES\n")
+
+            # Group vertices by northing
+            vertices_by_northing = {}
+            for vx, vy, vz in vertices:
+                northing_key = round(vy, 1)
+                if northing_key not in vertices_by_northing:
+                    vertices_by_northing[northing_key] = []
+                vertices_by_northing[northing_key].append((vx, vy, vz))
+
+            layer_name = obj_name.replace(' ', '_').replace('-', '_')
+
+            for northing, section_verts in sorted(vertices_by_northing.items()):
+                if len(section_verts) < 2:
+                    continue
+
+                # Sort and deduplicate
+                section_verts.sort(key=lambda v: v[0])
+                unique_verts = []
+                seen = set()
+                for v in section_verts:
+                    key = (round(v[0], 1), round(v[1], 1), round(v[2], 1))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_verts.append(v)
+
+                if len(unique_verts) < 4:
+                    # Too few points for spline, use polyline
+                    f.write("0\nPOLYLINE\n")
+                    f.write(f"8\n{layer_name}\n66\n1\n70\n8\n")
+                    for x, y, z in unique_verts:
+                        f.write(f"0\nVERTEX\n8\n{layer_name}\n10\n{x:.2f}\n20\n{y:.2f}\n30\n{z:.2f}\n")
+                    f.write("0\nSEQEND\n")
+                    continue
+
+                # Write as SPLINE entity
+                n_points = len(unique_verts)
+                degree = min(3, n_points - 1)  # Cubic spline or lower if not enough points
+
+                f.write("0\nSPLINE\n")
+                f.write(f"8\n{layer_name}\n")
+                f.write("100\nAcDbEntity\n")
+                f.write("100\nAcDbSpline\n")
+                f.write(f"71\n{degree}\n")  # Degree
+                f.write(f"72\n{n_points + degree + 1}\n")  # Number of knots
+                f.write(f"73\n{n_points}\n")  # Number of control points
+                f.write("74\n0\n")  # Number of fit points
+
+                # Write knots (uniform clamped knot vector)
+                for i in range(degree + 1):
+                    f.write(f"40\n0.0\n")
+                for i in range(n_points - degree - 1):
+                    f.write(f"40\n{(i + 1) / (n_points - degree):.6f}\n")
+                for i in range(degree + 1):
+                    f.write(f"40\n1.0\n")
+
+                # Write control points
+                for x, y, z in unique_verts:
+                    f.write(f"10\n{x:.4f}\n20\n{y:.4f}\n30\n{z:.4f}\n")
+
+            f.write("0\nENDSEC\n0\nEOF\n")
+
+    def _export_single_stl(self, filepath, obj_name, mesh_data):
+        """Export a single object to STL format."""
+        vertices = mesh_data.get('vertices', [])
+        faces = mesh_data.get('faces', [])
+
+        if not vertices or not faces:
+            return
+
+        with open(filepath, 'w') as f:
+            safe_name = obj_name.replace(' ', '_')
+            f.write(f"solid {safe_name}\n")
+
+            for face in faces:
+                if len(face) < 3:
+                    continue
+                i0, i1, i2 = face[0], face[1], face[2]
+                if i0 >= len(vertices) or i1 >= len(vertices) or i2 >= len(vertices):
+                    continue
+
+                v0 = vertices[i0]
+                v1 = vertices[i1]
+                v2 = vertices[i2]
+
+                # Calculate normal (simple cross product)
+                u = [v1[j] - v0[j] for j in range(3)]
+                v = [v2[j] - v0[j] for j in range(3)]
+                n = [
+                    u[1]*v[2] - u[2]*v[1],
+                    u[2]*v[0] - u[0]*v[2],
+                    u[0]*v[1] - u[1]*v[0]
+                ]
+                length = (n[0]**2 + n[1]**2 + n[2]**2)**0.5
+                if length > 0:
+                    n = [ni/length for ni in n]
+                else:
+                    n = [0, 0, 1]
+
+                f.write(f"  facet normal {n[0]:.6f} {n[1]:.6f} {n[2]:.6f}\n")
+                f.write("    outer loop\n")
+                f.write(f"      vertex {v0[0]:.6f} {v0[1]:.6f} {v0[2]:.6f}\n")
+                f.write(f"      vertex {v1[0]:.6f} {v1[1]:.6f} {v1[2]:.6f}\n")
+                f.write(f"      vertex {v2[0]:.6f} {v2[1]:.6f} {v2[2]:.6f}\n")
+                f.write("    endloop\n")
+                f.write("  endfacet\n")
+
+            f.write(f"endsolid {safe_name}\n")
+
+    def export_splines_to_dxf(self, filepath):
+        """Export all objects as splines to a single DXF file."""
+        if not self.object_meshes:
+            logger.warning("No mesh objects to export")
+            return
+
+        with open(filepath, 'w') as f:
+            f.write("0\nSECTION\n2\nENTITIES\n")
+
+            for obj_name, mesh_data in self.object_meshes.items():
+                vertices = mesh_data.get('vertices', [])
+                if not vertices:
+                    continue
+
+                # Group by northing
+                vertices_by_northing = {}
+                for vx, vy, vz in vertices:
+                    key = round(vy, 1)
+                    if key not in vertices_by_northing:
+                        vertices_by_northing[key] = []
+                    vertices_by_northing[key].append((vx, vy, vz))
+
+                layer = obj_name.replace(' ', '_').replace('-', '_')
+
+                for northing, verts in sorted(vertices_by_northing.items()):
+                    verts.sort(key=lambda v: v[0])
+                    unique = []
+                    seen = set()
+                    for v in verts:
+                        k = (round(v[0], 1), round(v[1], 1), round(v[2], 1))
+                        if k not in seen:
+                            seen.add(k)
+                            unique.append(v)
+
+                    if len(unique) < 4:
+                        continue
+
+                    n = len(unique)
+                    deg = min(3, n - 1)
+
+                    f.write(f"0\nSPLINE\n8\n{layer}\n")
+                    f.write("100\nAcDbEntity\n100\nAcDbSpline\n")
+                    f.write(f"71\n{deg}\n72\n{n + deg + 1}\n73\n{n}\n74\n0\n")
+
+                    for i in range(deg + 1):
+                        f.write("40\n0.0\n")
+                    for i in range(n - deg - 1):
+                        f.write(f"40\n{(i + 1) / (n - deg):.6f}\n")
+                    for i in range(deg + 1):
+                        f.write("40\n1.0\n")
+
+                    for x, y, z in unique:
+                        f.write(f"10\n{x:.4f}\n20\n{y:.4f}\n30\n{z:.4f}\n")
+
+            f.write("0\nENDSEC\n0\nEOF\n")
 
     def export_to_obj(self, filepath):
         """Export to Wavefront OBJ format with separate objects per formation.
@@ -7266,7 +7628,7 @@ class GeologicalCrossSectionGUI:
         # Clear selection state when toggling
         self.selected_contact_nodes = []
         self.dragging_node = None
-        self.contact_edit_mode = "delete"  # Default to delete mode
+        self.contact_edit_mode = "select"  # Default to select mode
         self.drawing_contact = None
         self.drawing_points = []
 
@@ -7310,8 +7672,11 @@ class GeologicalCrossSectionGUI:
 
         self.edit_mode_buttons = {}
         modes = [
+            ("Select", "select", "Click node to select it, shift+click for multi-select"),
+            ("Drag", "drag", "Click and drag selected nodes to move them"),
             ("Delete", "delete", "Click node to delete it"),
             ("Add", "add", "Click on line to add node"),
+            ("Split", "split", "Click node to split contact into two"),
             ("Draw", "draw", "Extend from ends or relocate middle nodes"),
         ]
         for label, mode, tooltip in modes:
@@ -7347,7 +7712,7 @@ class GeologicalCrossSectionGUI:
                   width=8).pack(side=tk.RIGHT, padx=5)
 
         self._update_edit_mode_buttons()
-        self.status_var.set("DELETE mode: Click a node to remove it")
+        self.status_var.set("SELECT mode: Click nodes to select, Shift+click for multi-select")
 
     def _hide_contact_edit_toolbar(self):
         """Hide the contact editing toolbar."""
@@ -7361,8 +7726,11 @@ class GeologicalCrossSectionGUI:
 
         # Update status message
         mode_messages = {
+            "select": "SELECT mode: Click node to select, Shift+click for multi-select, selected nodes are highlighted",
+            "drag": "DRAG mode: Click and drag to move selected nodes",
             "delete": "DELETE mode: Click a node to remove it",
             "add": "ADD mode: Click on a contact line to add a new node",
+            "split": "SPLIT mode: Click a node to split the contact into two at that point",
             "draw": "DRAW mode: Click first/last node to extend, or middle node to relocate",
         }
         self.status_var.set(mode_messages.get(mode, ""))
@@ -7429,9 +7797,54 @@ class GeologicalCrossSectionGUI:
             logger.debug(f"  contact_edit_mode: {self.contact_edit_mode}")
 
             # Handle based on current edit mode
-            mode = getattr(self, 'contact_edit_mode', 'delete')
+            mode = getattr(self, 'contact_edit_mode', 'select')
 
-            if mode == "delete":
+            if mode == "select":
+                # SELECT mode: click a node to select it (shift+click for multi-select)
+                clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+                if clicked_node:
+                    group_name, node_idx, node_data = clicked_node
+                    # Check for shift key for multi-select
+                    shift_held = event.key == 'shift' if hasattr(event, 'key') else False
+                    if not shift_held:
+                        # Clear previous selection
+                        self.selected_contact_nodes = []
+                    # Add/toggle selection
+                    node_key = (group_name, node_idx)
+                    if node_key in [(n[0], n[1]) for n in self.selected_contact_nodes]:
+                        # Deselect if already selected
+                        self.selected_contact_nodes = [n for n in self.selected_contact_nodes if (n[0], n[1]) != node_key]
+                        logger.debug(f"  SELECT mode: deselected node {node_idx} from {group_name}")
+                    else:
+                        # Add to selection
+                        self.selected_contact_nodes.append((group_name, node_idx, node_data))
+                        logger.debug(f"  SELECT mode: selected node {node_idx} from {group_name}")
+                    self._update_contact_node_highlights()
+                    self.status_var.set(f"Selected {len(self.selected_contact_nodes)} node(s)")
+                else:
+                    # Clicked on empty space - clear selection
+                    if not (event.key == 'shift' if hasattr(event, 'key') else False):
+                        self.selected_contact_nodes = []
+                        self._update_contact_node_highlights()
+                        self.status_var.set("Selection cleared")
+
+            elif mode == "drag":
+                # DRAG mode: start dragging selected nodes
+                clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+                if clicked_node:
+                    group_name, node_idx, node_data = clicked_node
+                    # If clicking on an unselected node, select it first
+                    node_key = (group_name, node_idx)
+                    if node_key not in [(n[0], n[1]) for n in self.selected_contact_nodes]:
+                        self.selected_contact_nodes = [(group_name, node_idx, node_data)]
+                        self._update_contact_node_highlights()
+                    # Start dragging
+                    self.dragging_node = (group_name, node_idx, node_data)
+                    self.drag_start_pos = (event.xdata, event.ydata)
+                    logger.debug(f"  DRAG mode: starting drag of {len(self.selected_contact_nodes)} node(s)")
+                    self.status_var.set(f"Dragging {len(self.selected_contact_nodes)} node(s)...")
+
+            elif mode == "delete":
                 # DELETE mode: click a node to delete it
                 clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
                 if clicked_node:
@@ -7439,13 +7852,37 @@ class GeologicalCrossSectionGUI:
                     logger.debug(f"  DELETE mode: removing node {node_idx} from {group_name}")
                     self._delete_single_node(group_name, node_idx, node_data)
 
+            elif mode == "split":
+                # SPLIT mode: click a node to split the contact at that point
+                clicked_node = self._find_contact_node_at(event.xdata, event.ydata)
+                if clicked_node:
+                    group_name, node_idx, node_data = clicked_node
+                    x_coords = node_data.get('x_coords', [])
+                    # Can't split at endpoints
+                    if node_idx == 0 or node_idx == len(x_coords) - 1:
+                        self.status_var.set("Cannot split at endpoint - select a middle node")
+                    else:
+                        logger.debug(f"  SPLIT mode: splitting {group_name} at node {node_idx}")
+                        self._split_contact_at_node(group_name, node_idx, node_data)
+                else:
+                    self.status_var.set("Click on a node (not endpoint) to split the contact")
+
             elif mode == "add":
-                # ADD mode: click on a line to add a node there
+                # ADD mode: click on a line to add a node there, then immediately drag it
                 clicked_line = self._find_contact_line_at(event.xdata, event.ydata)
                 if clicked_line:
                     group_name, segment_idx, node_data = clicked_line
                     logger.debug(f"  ADD mode: inserting node at segment {segment_idx} of {group_name}")
-                    self._insert_node_at_segment(group_name, segment_idx, node_data, event.xdata, event.ydata)
+                    new_node_idx = self._insert_node_at_segment(group_name, segment_idx, node_data, event.xdata, event.ydata)
+                    # Start dragging the newly inserted node immediately
+                    if new_node_idx is not None:
+                        # Select the new node
+                        self.selected_contact_nodes = [(group_name, new_node_idx, node_data)]
+                        self._update_contact_node_highlights()
+                        # Start dragging
+                        self.dragging_node = (group_name, new_node_idx, node_data)
+                        self.drag_start_pos = (event.xdata, event.ydata)
+                        self.status_var.set(f"Added node - drag to position")
                 else:
                     self.status_var.set("Click on a contact line to add a node")
 
@@ -7981,21 +8418,122 @@ class GeologicalCrossSectionGUI:
         self.status_var.set(f"Deleted node from {group_name}")
         self._update_node_selection_display()
 
-    def _insert_node_at_segment(self, group_name, segment_idx, node_data, click_x, click_y):
-        """Insert a new node on a contact line segment at the clicked position."""
+    def _update_contact_node_highlights(self):
+        """Update visual highlighting of selected contact nodes."""
+        # Refresh the display to show selected nodes
+        self.update_section_display()
+
+        # Draw highlights on selected nodes
+        if not self.selected_contact_nodes:
+            return
+
+        ax = self.ax_section
+
+        # Draw selection highlights
+        for group_name, node_idx, node_data in self.selected_contact_nodes:
+            x_coords = node_data.get('x_coords', [])
+            y_coords = node_data.get('y_coords', [])
+            if node_idx < len(x_coords):
+                x = x_coords[node_idx]
+                y = y_coords[node_idx]
+                # Draw highlight circle (larger, yellow)
+                ax.plot(x, y, 'o', markersize=14, markerfacecolor='none',
+                       markeredgecolor='yellow', markeredgewidth=3, zorder=1000)
+                # Draw selection indicator (small inner circle)
+                ax.plot(x, y, 'o', markersize=6, markerfacecolor='yellow',
+                       markeredgecolor='black', markeredgewidth=1, zorder=1001)
+
+        self.canvas_sections.draw_idle()
+
+    def _split_contact_at_node(self, group_name, node_idx, node_data):
+        """Split a contact line into two at the specified node."""
         polyline = node_data.get('polyline')
         if not polyline:
+            self.status_var.set("Cannot split - polyline not found")
             return
+
+        vertices = list(polyline.vertices)
+        n_points = len(vertices) // 2
+
+        # Can't split if too few points
+        if n_points < 3:
+            self.status_var.set("Cannot split - need at least 3 points")
+            return
+
+        # Can't split at endpoints
+        if node_idx <= 0 or node_idx >= n_points - 1:
+            self.status_var.set("Cannot split at endpoint - select a middle node")
+            return
+
+        # Save state for undo
+        self._push_undo('split_contact', {
+            'group_name': group_name,
+            'node_idx': node_idx,
+            'original_vertices': vertices.copy(),
+            'polyline': polyline
+        })
+
+        # Split into two parts: [0, node_idx] and [node_idx, end]
+        split_point = node_idx * 2
+        part1_vertices = vertices[:split_point + 2]  # Include split point
+        part2_vertices = vertices[split_point:]       # Start from split point
+
+        # Update original polyline with first part
+        polyline.vertices = part1_vertices
+        if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+            pdf_verts = list(polyline.pdf_vertices)
+            polyline.pdf_vertices = pdf_verts[:split_point + 2]
+
+        # Create a new polyline for the second part
+        # We need to add it to the grouped_contacts
+        if group_name in self.grouped_contacts:
+            group = self.grouped_contacts[group_name]
+            # Import ContactPolyline class
+            from geotools.contact_extraction import ContactPolyline
+
+            # Get northing from the polyline
+            northing = polyline.northing if hasattr(polyline, 'northing') else None
+            section_key = polyline.section_key if hasattr(polyline, 'section_key') else None
+
+            # Create new polyline for the second part
+            new_polyline = ContactPolyline(
+                vertices=part2_vertices,
+                northing=northing,
+                section_key=section_key
+            )
+            if hasattr(polyline, 'pdf_vertices') and polyline.pdf_vertices:
+                pdf_verts = list(polyline.pdf_vertices)
+                new_polyline.pdf_vertices = pdf_verts[split_point:]
+
+            group.polylines.append(new_polyline)
+            self.status_var.set(f"Split {group_name} into two parts at node {node_idx}")
+        else:
+            self.status_var.set(f"Split contact - now has {len(part1_vertices)//2} points")
+
+        # Clear selection and update display
+        self.selected_contact_nodes = []
+        self._update_node_selection_display()
+
+    def _insert_node_at_segment(self, group_name, segment_idx, node_data, click_x, click_y):
+        """Insert a new node on a contact line segment at the clicked position.
+
+        Returns:
+            int: The index of the newly inserted node, or None if insertion failed.
+        """
+        polyline = node_data.get('polyline')
+        if not polyline:
+            return None
 
         vertices = list(polyline.vertices)
 
         # Insert position is after segment_idx
         insert_vert_idx = (segment_idx + 1) * 2
+        new_node_idx = segment_idx + 1
 
         # Save state for undo
         self._push_undo('insert_node', {
             'group_name': group_name,
-            'node_idx': segment_idx + 1,
+            'node_idx': new_node_idx,
             'polyline': polyline
         })
 
@@ -8014,8 +8552,8 @@ class GeologicalCrossSectionGUI:
                 pdf_verts.insert(insert_vert_idx + 1, click_y)  # Placeholder
                 polyline.pdf_vertices = pdf_verts
 
-        self.status_var.set(f"Added node to {group_name}")
         self._update_node_selection_display()
+        return new_node_idx
 
     def _push_undo(self, action_type, data):
         """Push an action onto the undo stack."""
@@ -9088,41 +9626,84 @@ class GeologicalCrossSectionGUI:
         self.update_3d_view()
 
     def bulk_assign_selected(self):
-        """Bulk assign all selected units to the unit chosen in the combobox."""
-        if not self.selected_units:
-            messagebox.showinfo("No Selection", "Please select units first using 'Select Similar' or by clicking on the map.")
+        """Bulk assign selected items to the item chosen in the combobox.
+
+        In fault mode: assigns selected polylines to the selected fault
+        In polygon mode: assigns selected polygons to the selected unit
+        """
+        mode = getattr(self, 'classification_mode', 'none')
+        target_name = self.bulk_assign_combo.get()
+
+        if not target_name:
+            messagebox.showinfo("No Target Selected", "Please choose an item from the dropdown.")
             return
 
-        unit_name = self.bulk_assign_combo.get()
-        if not unit_name:
-            messagebox.showinfo("No Unit Selected", "Please choose a unit from the dropdown.")
-            return
+        if mode == 'fault':
+            # Fault mode: assign polylines to faults
+            if not self.selected_polylines:
+                messagebox.showinfo("No Selection", "Please select polylines first by clicking on them in the map.")
+                return
 
-        # Find the unit in defined_units
-        if unit_name not in self.defined_units:
-            messagebox.showerror("Error", f"Unit '{unit_name}' not found in defined units.")
-            return
+            if target_name not in self.defined_faults:
+                messagebox.showerror("Error", f"Fault '{target_name}' not found in defined faults.")
+                return
 
-        assigned_count = 0
-        for feature_name in list(self.selected_units):
-            if feature_name in self.all_geological_units:
-                self._assign_polygon_to_unit(feature_name, unit_name)
+            assigned_count = 0
+            for line_name in list(self.selected_polylines):
+                self._assign_line_to_fault(line_name, target_name)
                 assigned_count += 1
 
-        if assigned_count > 0:
-            self.selected_units.clear()
-            self.update_selection_display()
-            self.update_section_display()
-            messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polygons to {unit_name}")
-            logger.info(f"Bulk assigned {assigned_count} polygons to {unit_name}")
+            if assigned_count > 0:
+                self.selected_polylines.clear()
+                self.update_selection_display()
+                self.update_section_display()
+                messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polylines to fault '{target_name}'")
+                logger.info(f"Bulk assigned {assigned_count} polylines to fault {target_name}")
+        else:
+            # Polygon mode (default): assign units to geological units
+            if not self.selected_units:
+                messagebox.showinfo("No Selection", "Please select units first using 'Select Similar' or by clicking on the map.")
+                return
+
+            if target_name not in self.defined_units:
+                messagebox.showerror("Error", f"Unit '{target_name}' not found in defined units.")
+                return
+
+            assigned_count = 0
+            for feature_name in list(self.selected_units):
+                if feature_name in self.all_geological_units:
+                    self._assign_polygon_to_unit(feature_name, target_name)
+                    assigned_count += 1
+
+            if assigned_count > 0:
+                self.selected_units.clear()
+                self.update_selection_display()
+                self.update_section_display()
+                messagebox.showinfo("Assignment Complete", f"Assigned {assigned_count} polygons to {target_name}")
+                logger.info(f"Bulk assigned {assigned_count} polygons to {target_name}")
 
     def update_bulk_assign_combo(self):
-        """Update the bulk assignment combobox with available units."""
+        """Update the bulk assignment combobox based on current classification mode.
+
+        In polygon mode: shows available geological units
+        In fault mode: shows available faults
+        In other modes: shows units (default)
+        """
         if hasattr(self, 'bulk_assign_combo'):
-            unit_names = [unit.name for unit in self.strat_column.get_all_units_ordered()]
-            self.bulk_assign_combo['values'] = unit_names
-            if unit_names and not self.bulk_assign_combo.get():
-                self.bulk_assign_combo.set(unit_names[0])
+            mode = getattr(self, 'classification_mode', 'none')
+
+            if mode == 'fault':
+                # Show faults in fault mode
+                fault_names = list(self.defined_faults.keys())
+                self.bulk_assign_combo['values'] = fault_names
+                if fault_names and self.bulk_assign_combo.get() not in fault_names:
+                    self.bulk_assign_combo.set(fault_names[0] if fault_names else '')
+            else:
+                # Show units in polygon mode and other modes
+                unit_names = [unit.name for unit in self.strat_column.get_all_units_ordered()]
+                self.bulk_assign_combo['values'] = unit_names
+                if unit_names and self.bulk_assign_combo.get() not in unit_names:
+                    self.bulk_assign_combo.set(unit_names[0] if unit_names else '')
 
     def assign_selected_units(self, strat_unit):
         """Assign selected units to a stratigraphic unit."""
@@ -9454,7 +10035,10 @@ class GeologicalCrossSectionGUI:
             btn.config(relief=tk.RAISED, bd=2)
         for btn in self.fault_buttons.values():
             btn.config(relief=tk.RAISED, bd=2)
-        
+
+        # Update bulk assign dropdown for the new mode
+        self.update_bulk_assign_combo()
+
         self.update_section_display()
 
     def refresh_feature_browser(self):
@@ -9970,6 +10554,9 @@ class GeologicalCrossSectionGUI:
                                 command=lambda f=fault_name: self.delete_fault(f))
             btn_del.pack(side=tk.LEFT, padx=1)
 
+        # Update dropdown if in fault mode
+        self.update_bulk_assign_combo()
+
     def edit_fault(self, fault_name: str):
         """Edit a fault's properties (color, type)."""
         fault_data = self.defined_faults.get(fault_name, {})
@@ -10066,37 +10653,24 @@ class GeologicalCrossSectionGUI:
         logger.info(f"Moved fault '{fault_name}' down")
 
     def select_unit_for_assignment(self, unit_name: str):
-        """Select a unit for assignment. If features are selected, assign them all."""
+        """Select a unit for assignment. Click on items to assign them one by one.
+
+        For bulk assignment of selected items, use the dropdown+Go button instead.
+        """
         if self.classification_mode != "polygon":
             self.mode_var.set("polygon")
             self.on_classification_mode_changed()
-        
+
         self.current_unit_assignment = unit_name
         self.current_fault_assignment = None
-        
+
         for name, btn in self.unit_buttons.items():
             btn.config(relief=tk.SUNKEN if name == unit_name else tk.RAISED, bd=4 if name == unit_name else 2)
         for btn in self.fault_buttons.values():
             btn.config(relief=tk.RAISED, bd=2)
-        
-        self.assignment_label.config(text=f"Assigning to: {unit_name}")
+
+        self.assignment_label.config(text=f"Click items to assign to: {unit_name}")
         logger.info(f"Selected unit for assignment: {unit_name}")
-
-        # If features are selected (from "Select Similar" or multi-select), assign them all
-        if self.selected_units:
-            assigned_count = 0
-            for feature_name in list(self.selected_units):
-                # Check if it's a polygon
-                if feature_name in self.all_geological_units:
-                    self._assign_polygon_to_unit(feature_name, unit_name)
-                    assigned_count += 1
-
-            if assigned_count > 0:
-                self.status_var.set(f"Assigned {assigned_count} features to {unit_name}")
-                logger.info(f"Bulk assigned {assigned_count} features to {unit_name}")
-                self.selected_units.clear()  # Clear selection after bulk assign
-                self.update_selection_display()
-                self.update_section_display()
 
     def clear_polygon_assignment(self, polygon_name: str):
         """Clear the assignment from a polygon (reset to UNKNOWN)."""
@@ -10157,20 +10731,23 @@ class GeologicalCrossSectionGUI:
         logger.info(f"Unassigned {unassigned_count} features")
     
     def select_fault_for_assignment(self, fault_name: str):
-        """Select a fault for assignment."""
+        """Select a fault for assignment. Click on items to assign them one by one.
+
+        For bulk assignment of selected items, use the dropdown+Go button instead.
+        """
         if self.classification_mode != "fault":
             self.mode_var.set("fault")
             self.on_classification_mode_changed()
-        
+
         self.current_fault_assignment = fault_name
         self.current_unit_assignment = None
-        
+
         for name, btn in self.fault_buttons.items():
             btn.config(relief=tk.SUNKEN if name == fault_name else tk.RAISED, bd=4 if name == fault_name else 2)
         for btn in self.unit_buttons.values():
             btn.config(relief=tk.RAISED, bd=2)
-        
-        self.assignment_label.config(text=f"Assigning to: {fault_name}")
+
+        self.assignment_label.config(text=f"Click lines to assign to: {fault_name}")
         logger.info(f"Selected fault for assignment: {fault_name}")
 
     def add_new_unit(self):
