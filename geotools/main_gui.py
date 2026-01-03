@@ -2190,11 +2190,11 @@ class GeologicalCrossSectionGUI:
 
     # Part 4: 3D Visualization Tab
     def create_3d_tab(self):
-        """Create the 3D visualization tab."""
+        """Create the 3D visualization tab with unit selector."""
         view3d_frame = ttk.Frame(self.main_notebook)
         self.main_notebook.add(view3d_frame, text="3D View")
 
-        # Control panel
+        # Control panel at top
         control_frame = ttk.Frame(view3d_frame)
         control_frame.pack(fill=tk.X, padx=5, pady=5)
 
@@ -2233,12 +2233,61 @@ class GeologicalCrossSectionGUI:
             side=tk.LEFT, padx=5
         )
 
+        # Main content area with PanedWindow for resizable split
+        content_pane = ttk.PanedWindow(view3d_frame, orient=tk.HORIZONTAL)
+        content_pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Left panel - Unit selector
+        selector_frame = ttk.LabelFrame(content_pane, text="Unit Selector", padding=5)
+        content_pane.add(selector_frame, weight=1)
+
+        # Selection buttons
+        btn_frame = ttk.Frame(selector_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Button(btn_frame, text="Select All", command=self._select_all_3d_units).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(btn_frame, text="Deselect All", command=self._deselect_all_3d_units).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(btn_frame, text="Refresh", command=self._refresh_3d_unit_tree).pack(
+            side=tk.LEFT, padx=2
+        )
+
+        # Treeview for unit selection
+        tree_container = ttk.Frame(selector_frame)
+        tree_container.pack(fill=tk.BOTH, expand=True)
+
+        self.unit_3d_tree = ttk.Treeview(
+            tree_container,
+            columns=("sections", "selected"),
+            selectmode=tk.EXTENDED,
+            height=20
+        )
+        self.unit_3d_tree.heading("#0", text="Formation / Unit")
+        self.unit_3d_tree.heading("sections", text="Sections")
+        self.unit_3d_tree.heading("selected", text="Selected")
+        self.unit_3d_tree.column("#0", width=150, minwidth=100)
+        self.unit_3d_tree.column("sections", width=60, minwidth=40)
+        self.unit_3d_tree.column("selected", width=60, minwidth=40)
+
+        tree_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.unit_3d_tree.yview)
+        self.unit_3d_tree.configure(yscrollcommand=tree_scroll.set)
+        self.unit_3d_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Bind selection events
+        self.unit_3d_tree.bind("<<TreeviewSelect>>", self._on_3d_tree_select)
+        self.unit_3d_tree.bind("<Double-1>", self._on_3d_tree_double_click)
+
+        # Right panel - 3D view
+        canvas_frame = ttk.Frame(content_pane)
+        content_pane.add(canvas_frame, weight=4)
+
         # 3D figure
         self.fig_3d = plt.figure(figsize=(12, 8))
         self.ax_3d = self.fig_3d.add_subplot(111, projection="3d")
-
-        canvas_frame = ttk.Frame(view3d_frame)
-        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         self.canvas_3d = FigureCanvasTkAgg(self.fig_3d, canvas_frame)
         self.canvas_3d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -2246,6 +2295,162 @@ class GeologicalCrossSectionGUI:
         # Add toolbar
         toolbar_3d = NavigationToolbar2Tk(self.canvas_3d, canvas_frame)
         toolbar_3d.update()
+
+    def _refresh_3d_unit_tree(self):
+        """Refresh the 3D unit selector tree with current units grouped by formation."""
+        # Clear existing items
+        for item in self.unit_3d_tree.get_children():
+            self.unit_3d_tree.delete(item)
+
+        # Group units by formation
+        formations = {}
+        for unit_name, unit in self.all_geological_units.items():
+            formation = unit.get("formation", "Unknown")
+            if formation not in formations:
+                formations[formation] = []
+            formations[formation].append((unit_name, unit))
+
+        # Sort formations and add to tree
+        for formation in sorted(formations.keys()):
+            units = formations[formation]
+            # Count how many sections this formation appears in
+            northings = set()
+            for unit_name, unit in units:
+                northing = unit.get("northing")
+                if northing is not None:
+                    northings.add(northing)
+
+            # Add formation as parent node
+            formation_id = self.unit_3d_tree.insert(
+                "", tk.END,
+                text=formation,
+                values=(len(northings), ""),
+                open=True,
+                tags=("formation", formation)
+            )
+
+            # Get color for formation (from first unit)
+            if units:
+                color = units[0][1].get("color", (0.5, 0.5, 0.5))
+                if isinstance(color, tuple) and len(color) >= 3:
+                    hex_color = "#{:02x}{:02x}{:02x}".format(
+                        int(color[0] * 255), int(color[1] * 255), int(color[2] * 255)
+                    )
+                    self.unit_3d_tree.tag_configure(formation, background=hex_color)
+
+            # Add individual units under formation
+            for unit_name, unit in sorted(units, key=lambda x: x[1].get("northing", 0)):
+                northing = unit.get("northing", 0)
+                is_selected = "✓" if unit_name in self.selected_units else ""
+                self.unit_3d_tree.insert(
+                    formation_id, tk.END,
+                    text=f"  N={northing:.0f}",
+                    values=("", is_selected),
+                    tags=("unit", unit_name)
+                )
+
+    def _on_3d_tree_select(self, event):
+        """Handle selection change in 3D unit tree."""
+        # Update selected_units based on tree selection
+        selection = self.unit_3d_tree.selection()
+
+        for item in selection:
+            tags = self.unit_3d_tree.item(item, "tags")
+            if len(tags) >= 2:
+                if tags[0] == "formation":
+                    # Select all units in this formation
+                    formation = tags[1]
+                    for unit_name, unit in self.all_geological_units.items():
+                        if unit.get("formation") == formation:
+                            self.selected_units.add(unit_name)
+                elif tags[0] == "unit":
+                    # Select individual unit
+                    unit_name = tags[1]
+                    self.selected_units.add(unit_name)
+
+        self._update_3d_tree_selection_marks()
+
+    def _on_3d_tree_double_click(self, event):
+        """Handle double-click to toggle selection."""
+        item = self.unit_3d_tree.identify_row(event.y)
+        if not item:
+            return
+
+        tags = self.unit_3d_tree.item(item, "tags")
+        if len(tags) >= 2:
+            if tags[0] == "formation":
+                # Toggle all units in this formation
+                formation = tags[1]
+                formation_units = [
+                    name for name, unit in self.all_geological_units.items()
+                    if unit.get("formation") == formation
+                ]
+                # Check if any are selected
+                any_selected = any(u in self.selected_units for u in formation_units)
+                if any_selected:
+                    # Deselect all
+                    for u in formation_units:
+                        self.selected_units.discard(u)
+                else:
+                    # Select all
+                    for u in formation_units:
+                        self.selected_units.add(u)
+            elif tags[0] == "unit":
+                # Toggle individual unit
+                unit_name = tags[1]
+                if unit_name in self.selected_units:
+                    self.selected_units.discard(unit_name)
+                else:
+                    self.selected_units.add(unit_name)
+
+        self._update_3d_tree_selection_marks()
+        self.update_3d_display()
+
+    def _update_3d_tree_selection_marks(self):
+        """Update the selection marks in the 3D tree."""
+        for item in self.unit_3d_tree.get_children():
+            # Check formation items
+            tags = self.unit_3d_tree.item(item, "tags")
+            if len(tags) >= 2 and tags[0] == "formation":
+                formation = tags[1]
+                # Count selected units in this formation
+                formation_units = [
+                    name for name, unit in self.all_geological_units.items()
+                    if unit.get("formation") == formation
+                ]
+                selected_count = sum(1 for u in formation_units if u in self.selected_units)
+                total_count = len(formation_units)
+
+                if selected_count == 0:
+                    mark = ""
+                elif selected_count == total_count:
+                    mark = "✓"
+                else:
+                    mark = f"{selected_count}/{total_count}"
+
+                current_values = self.unit_3d_tree.item(item, "values")
+                self.unit_3d_tree.item(item, values=(current_values[0], mark))
+
+            # Check child unit items
+            for child in self.unit_3d_tree.get_children(item):
+                child_tags = self.unit_3d_tree.item(child, "tags")
+                if len(child_tags) >= 2 and child_tags[0] == "unit":
+                    unit_name = child_tags[1]
+                    is_selected = "✓" if unit_name in self.selected_units else ""
+                    self.unit_3d_tree.item(child, values=("", is_selected))
+
+    def _select_all_3d_units(self):
+        """Select all units for 3D view."""
+        for unit_name in self.all_geological_units:
+            self.selected_units.add(unit_name)
+        self._update_3d_tree_selection_marks()
+        self.update_3d_display()
+
+    def _deselect_all_3d_units(self):
+        """Deselect all units for 3D view."""
+        self.selected_units.clear()
+        self._update_3d_tree_selection_marks()
+        self.update_3d_display()
 
     def update_display(self):
         """Update the current display based on active tab."""
@@ -3371,6 +3576,10 @@ class GeologicalCrossSectionGUI:
 
     def update_3d_display(self):
         """Update 3D display based on mode."""
+        # Refresh the unit selector tree if it exists
+        if hasattr(self, 'unit_3d_tree'):
+            self._refresh_3d_unit_tree()
+
         self.ax_3d.clear()
 
         if not self.selected_units:
@@ -3829,6 +4038,86 @@ class GeologicalCrossSectionGUI:
 
         return matches
 
+    def _add_polygon_end_cap(self, coords, northing, color, flip_normal=False, alpha=0.7):
+        """Add an end cap (filled polygon face) to close a solid volume.
+
+        Uses fan triangulation from the centroid to create triangular faces.
+        Handles disconnected polygon parts separately.
+
+        Args:
+            coords: 2D polygon coordinates (N x 2 array of [x, z])
+            northing: Y coordinate for the cap
+            color: RGB color tuple
+            flip_normal: If True, reverse winding for opposite-facing normal
+            alpha: Transparency
+        """
+        coords = np.asarray(coords)
+        if len(coords) < 3:
+            return
+
+        # Split into disconnected parts if needed
+        parts = self._split_disconnected_polygons(coords)
+
+        for part in parts:
+            if len(part) < 3:
+                continue
+
+            # Ensure polygon is closed
+            if not np.allclose(part[0], part[-1]):
+                part = np.vstack([part, part[0]])
+
+            # Calculate centroid
+            centroid = np.mean(part[:-1], axis=0)  # Exclude duplicate closing point
+
+            # Build 3D vertices: centroid first, then perimeter points
+            base_index = len(self.mesh_vertices)
+
+            # Add centroid vertex
+            self.mesh_vertices.append([centroid[0], northing, centroid[1]])
+
+            # Add perimeter vertices
+            n_perimeter = len(part) - 1  # Exclude closing point
+            for i in range(n_perimeter):
+                self.mesh_vertices.append([part[i, 0], northing, part[i, 1]])
+
+            # Create fan triangles from centroid to perimeter
+            faces = []
+            for i in range(n_perimeter):
+                next_i = (i + 1) % n_perimeter
+                if flip_normal:
+                    # Reverse winding
+                    faces.append([
+                        base_index,  # Centroid
+                        base_index + 1 + next_i,  # Next perimeter point
+                        base_index + 1 + i,  # Current perimeter point
+                    ])
+                else:
+                    faces.append([
+                        base_index,  # Centroid
+                        base_index + 1 + i,  # Current perimeter point
+                        base_index + 1 + next_i,  # Next perimeter point
+                    ])
+
+            self.mesh_faces.extend(faces)
+
+            # Visualize the cap
+            verts = np.array([[centroid[0], northing, centroid[1]]] +
+                           [[part[i, 0], northing, part[i, 1]] for i in range(n_perimeter)])
+
+            local_faces = np.array([[0, i + 1, ((i + 1) % n_perimeter) + 1] for i in range(n_perimeter)])
+            if flip_normal:
+                local_faces = local_faces[:, ::-1]
+
+            self.ax_3d.plot_trisurf(
+                verts[:, 0],
+                verts[:, 1],
+                verts[:, 2],
+                triangles=local_faces,
+                color=color,
+                alpha=alpha,
+                edgecolor="none",
+                shade=True,
+            )
 
     def connect_sections_simple(self, section1, section2, alpha=0.7):
         """Simple connection between sections without triangulation."""
@@ -3944,6 +4233,40 @@ class GeologicalCrossSectionGUI:
 
                     self.create_mesh_between_sections(section1, section2, alpha=0.9)
 
+                # Add end caps to close the solid volume
+                if len(block) >= 2:
+                    # First section cap (front face)
+                    first_unit = block[0]
+                    first_coords = np.array([
+                        (first_unit["vertices"][j], first_unit["vertices"][j + 1])
+                        for j in range(0, len(first_unit["vertices"]), 2)
+                        if j + 1 < len(first_unit["vertices"])
+                    ])
+                    if len(first_coords) >= 3:
+                        self._add_polygon_end_cap(
+                            first_coords,
+                            first_unit.get("northing", 0.0),
+                            first_unit.get("color", (0.5, 0.5, 0.5)),
+                            flip_normal=True,  # Face outward (toward smaller northing)
+                            alpha=0.9
+                        )
+
+                    # Last section cap (back face)
+                    last_unit = block[-1]
+                    last_coords = np.array([
+                        (last_unit["vertices"][j], last_unit["vertices"][j + 1])
+                        for j in range(0, len(last_unit["vertices"]), 2)
+                        if j + 1 < len(last_unit["vertices"])
+                    ])
+                    if len(last_coords) >= 3:
+                        self._add_polygon_end_cap(
+                            last_coords,
+                            last_unit.get("northing", 0.0),
+                            last_unit.get("color", (0.5, 0.5, 0.5)),
+                            flip_normal=False,  # Face outward (toward larger northing)
+                            alpha=0.9
+                        )
+
         self.ax_3d.set_xlabel("Easting (m)")
         self.ax_3d.set_ylabel("Northing (m)")
         self.ax_3d.set_zlabel("RL (m)")
@@ -4001,6 +4324,7 @@ class GeologicalCrossSectionGUI:
 
         - If their centroids are far apart compared to their size, treat
           as pinch-out and do not connect.
+        - If a fault separates them, do not connect.
         """
         c1, size1 = self._unit_centroid_and_size(u1)
         c2, size2 = self._unit_centroid_and_size(u2)
@@ -4012,7 +4336,88 @@ class GeologicalCrossSectionGUI:
         dist = ((c1[0] - c2[0]) ** 2 + (c1[1] - c2[1]) ** 2) ** 0.5
         typical_size = max(size1, size2, 1.0)
 
-        return dist <= max_shape_mismatch_factor * typical_size
+        if dist > max_shape_mismatch_factor * typical_size:
+            return False
+
+        # Check if a fault separates these units
+        if self._fault_separates_units(u1, u2):
+            return False
+
+        return True
+
+    def _fault_separates_units(self, u1, u2):
+        """
+        Check if any assigned fault line runs between two units.
+
+        A fault is considered to separate units if:
+        1. The fault exists in either section (by northing)
+        2. The fault's horizontal extent overlaps with the units' bounding boxes
+        3. The fault's vertical extent intersects the connection corridor between units
+
+        Returns True if units are separated by a fault.
+        """
+        n1 = u1.get("northing")
+        n2 = u2.get("northing")
+        if n1 is None or n2 is None:
+            return False
+
+        # Get unit bounding boxes
+        verts1 = u1.get("vertices", [])
+        verts2 = u2.get("vertices", [])
+        if len(verts1) < 6 or len(verts2) < 6:
+            return False
+
+        xs1 = [verts1[i] for i in range(0, len(verts1), 2)]
+        zs1 = [verts1[i + 1] for i in range(0, len(verts1), 2) if i + 1 < len(verts1)]
+        xs2 = [verts2[i] for i in range(0, len(verts2), 2)]
+        zs2 = [verts2[i + 1] for i in range(0, len(verts2), 2) if i + 1 < len(verts2)]
+
+        # Combined bounding box for the connection corridor
+        min_x = min(min(xs1), min(xs2))
+        max_x = max(max(xs1), max(xs2))
+        min_z = min(min(zs1), min(zs2))
+        max_z = max(max(zs1), max(zs2))
+
+        # Check faults in sections at or between these northings
+        min_n, max_n = min(n1, n2), max(n1, n2)
+
+        for (pdf_path, page_num), section_data in self.all_sections_data.items():
+            section_northing = section_data.get("northing")
+            if section_northing is None:
+                continue
+
+            # Check faults in sections at either end or between
+            if not (min_n <= section_northing <= max_n):
+                continue
+
+            for poly_name, polyline in section_data.get("polylines", {}).items():
+                # Only check assigned faults
+                fault_assignment = polyline.get("fault_assignment")
+                is_fault = polyline.get("is_fault", False) or polyline.get("type") == "Fault"
+
+                if not (fault_assignment or is_fault):
+                    continue
+
+                fault_verts = polyline.get("vertices", [])
+                if len(fault_verts) < 4:
+                    continue
+
+                # Get fault bounding box
+                fault_xs = [fault_verts[i] for i in range(0, len(fault_verts), 2)]
+                fault_zs = [fault_verts[i + 1] for i in range(0, len(fault_verts), 2) if i + 1 < len(fault_verts)]
+
+                fault_min_x, fault_max_x = min(fault_xs), max(fault_xs)
+                fault_min_z, fault_max_z = min(fault_zs), max(fault_zs)
+
+                # Check if fault overlaps with the unit corridor
+                x_overlap = fault_min_x <= max_x and fault_max_x >= min_x
+                z_overlap = fault_min_z <= max_z and fault_max_z >= min_z
+
+                if x_overlap and z_overlap:
+                    logger.info(f"Fault '{fault_assignment or poly_name}' separates units at N={n1} and N={n2}")
+                    return True
+
+        return False
 
     def _unit_centroid_and_size(self, unit):
         """
