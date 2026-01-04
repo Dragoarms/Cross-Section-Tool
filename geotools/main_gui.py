@@ -4392,7 +4392,32 @@ class GeologicalCrossSectionGUI:
             blocks = self._group_units_by_northing_gap(units, factor=max_gap_factor)
 
             for block in blocks:
-                if len(block) < 2:
+                # Handle single-unit blocks - add flat polygon representation with caps
+                if len(block) == 1:
+                    single_unit = block[0]
+                    single_coords = np.array([
+                        (single_unit["vertices"][j], single_unit["vertices"][j + 1])
+                        for j in range(0, len(single_unit["vertices"]), 2)
+                        if j + 1 < len(single_unit["vertices"])
+                    ])
+                    if len(single_coords) >= 3:
+                        # Add front and back caps at same position (flat polygon)
+                        self._add_polygon_end_cap(
+                            single_coords,
+                            single_unit.get("northing", 0.0),
+                            single_unit.get("color", (0.5, 0.5, 0.5)),
+                            flip_normal=True,
+                            alpha=0.9,
+                            object_name=formation
+                        )
+                        self._add_polygon_end_cap(
+                            single_coords,
+                            single_unit.get("northing", 0.0),
+                            single_unit.get("color", (0.5, 0.5, 0.5)),
+                            flip_normal=False,
+                            alpha=0.9,
+                            object_name=formation
+                        )
                     continue
 
                 # Loft between adjacent units in this block if they are similar enough
@@ -5550,43 +5575,79 @@ class GeologicalCrossSectionGUI:
             f.write(f"endsolid {safe_name}\n")
 
     def export_splines_to_dxf(self, filepath):
-        """Export all objects as splines to a single DXF file."""
-        if not self.object_meshes:
-            logger.warning("No mesh objects to export")
-            return
+        """Export contacts and faults as splines to a single DXF file.
 
+        Uses ORIGINAL polyline vertex order from contacts (not sorted).
+        """
         with open(filepath, 'w') as f:
             f.write("0\nSECTION\n2\nENTITIES\n")
 
-            for obj_name, mesh_data in self.object_meshes.items():
-                vertices = mesh_data.get('vertices', [])
-                if not vertices:
-                    continue
+            exported_count = 0
 
-                # Group by northing
-                vertices_by_northing = {}
-                for vx, vy, vz in vertices:
-                    key = round(vy, 1)
-                    if key not in vertices_by_northing:
-                        vertices_by_northing[key] = []
-                    vertices_by_northing[key].append((vx, vy, vz))
+            # Export contacts using original ordered vertices
+            if hasattr(self, 'grouped_contacts') and self.grouped_contacts:
+                for group_name, group in self.grouped_contacts.items():
+                    layer = group_name.replace(' ', '_').replace('-', '_')
 
-                layer = obj_name.replace(' ', '_').replace('-', '_')
+                    for polyline in group.polylines:
+                        vertices = polyline.vertices
+                        northing = polyline.northing
 
-                for northing, verts in sorted(vertices_by_northing.items()):
-                    verts.sort(key=lambda v: v[0])
-                    unique = []
-                    seen = set()
-                    for v in verts:
-                        k = (round(v[0], 1), round(v[1], 1), round(v[2], 1))
-                        if k not in seen:
-                            seen.add(k)
-                            unique.append(v)
+                        if len(vertices) < 8:  # Need at least 4 points for spline
+                            continue
 
-                    if len(unique) < 4:
+                        # Convert to 3D points - keep ORIGINAL order
+                        points = []
+                        for i in range(0, len(vertices), 2):
+                            if i + 1 < len(vertices):
+                                points.append((vertices[i], northing, vertices[i + 1]))
+
+                        if len(points) < 4:
+                            continue
+
+                        n = len(points)
+                        deg = min(3, n - 1)
+
+                        f.write(f"0\nSPLINE\n8\n{layer}\n")
+                        f.write("100\nAcDbEntity\n100\nAcDbSpline\n")
+                        f.write(f"71\n{deg}\n72\n{n + deg + 1}\n73\n{n}\n74\n0\n")
+
+                        for i in range(deg + 1):
+                            f.write("40\n0.0\n")
+                        for i in range(n - deg - 1):
+                            f.write(f"40\n{(i + 1) / (n - deg):.6f}\n")
+                        for i in range(deg + 1):
+                            f.write("40\n1.0\n")
+
+                        for x, y, z in points:
+                            f.write(f"10\n{x:.4f}\n20\n{y:.4f}\n30\n{z:.4f}\n")
+
+                        exported_count += 1
+
+            # Export faults using original ordered vertices
+            for (pdf, page), section_data in self.all_sections_data.items():
+                for line_name, line_data in section_data.get('polylines', {}).items():
+                    if not line_data.get('is_fault', False):
                         continue
 
-                    n = len(unique)
+                    vertices = line_data.get('vertices', [])
+                    northing = section_data.get('coord_system', {}).get('northing', 0)
+
+                    if len(vertices) < 8:
+                        continue
+
+                    fault_name = line_data.get('fault_name', '') or line_data.get('fault_assignment', '') or 'FAULT'
+                    layer = fault_name.replace(' ', '_').replace('-', '_')
+
+                    points = []
+                    for i in range(0, len(vertices), 2):
+                        if i + 1 < len(vertices):
+                            points.append((vertices[i], northing, vertices[i + 1]))
+
+                    if len(points) < 4:
+                        continue
+
+                    n = len(points)
                     deg = min(3, n - 1)
 
                     f.write(f"0\nSPLINE\n8\n{layer}\n")
@@ -5600,10 +5661,14 @@ class GeologicalCrossSectionGUI:
                     for i in range(deg + 1):
                         f.write("40\n1.0\n")
 
-                    for x, y, z in unique:
+                    for x, y, z in points:
                         f.write(f"10\n{x:.4f}\n20\n{y:.4f}\n30\n{z:.4f}\n")
 
+                    exported_count += 1
+
             f.write("0\nENDSEC\n0\nEOF\n")
+
+        logger.info(f"Exported {exported_count} splines to DXF")
 
     def export_to_obj(self, filepath):
         """Export to Wavefront OBJ format with separate objects per formation.
@@ -5675,91 +5740,117 @@ class GeologicalCrossSectionGUI:
                         f.write("\n\n")
 
     def export_key_points_to_dxf(self, filepath):
-        """Export key mesh vertices to DXF format for Leapfrog editing.
+        """Export contact polylines and mesh data to DXF format for Leapfrog editing.
 
-        Exports control points for each object as 3D polylines organized by layer.
+        Uses ORIGINAL polyline vertex order from contacts (not sorted), which preserves
+        the natural flow of the line and avoids zigzagging.
+
         Each object (formation, fault, contact) gets its own layer.
-        Points can be used in Leapfrog to add bezier control lines or edit surfaces.
         """
-        if not self.object_meshes:
-            logger.warning("No mesh objects to export")
-            return
-
         with open(filepath, "w") as f:
             # DXF header
             f.write("0\nSECTION\n2\nENTITIES\n")
 
-            for obj_name, mesh_data in self.object_meshes.items():
-                vertices = mesh_data.get('vertices', [])
-                if not vertices:
-                    continue
+            exported_count = 0
 
-                # Sanitize layer name
-                layer_name = obj_name.replace(' ', '_').replace('-', '_').replace('/', '_')
+            # Export contacts using original ordered vertices from grouped_contacts
+            if hasattr(self, 'grouped_contacts') and self.grouped_contacts:
+                for group_name, group in self.grouped_contacts.items():
+                    layer_name = group_name.replace(' ', '_').replace('-', '_').replace('/', '_')
 
-                # Group vertices by northing (Y coordinate) to create section polylines
-                vertices_by_northing = {}
-                for vx, vy, vz in vertices:
-                    # Round northing to group nearby points
-                    northing_key = round(vy, 1)
-                    if northing_key not in vertices_by_northing:
-                        vertices_by_northing[northing_key] = []
-                    vertices_by_northing[northing_key].append((vx, vy, vz))
+                    for polyline in group.polylines:
+                        vertices = polyline.vertices
+                        northing = polyline.northing
 
-                # Write each section as a polyline
-                for northing, section_verts in sorted(vertices_by_northing.items()):
-                    if len(section_verts) < 2:
+                        if len(vertices) < 4:  # Need at least 2 points (4 coords)
+                            continue
+
+                        # Convert flat vertices [e1, rl1, e2, rl2, ...] to 3D points
+                        points = []
+                        for i in range(0, len(vertices), 2):
+                            if i + 1 < len(vertices):
+                                points.append((vertices[i], northing, vertices[i + 1]))
+
+                        if len(points) < 2:
+                            continue
+
+                        # Write as 3D polyline - vertices in ORIGINAL order (no sorting!)
+                        section_layer = f"{layer_name}_{int(northing)}"
+                        f.write("0\nPOLYLINE\n")
+                        f.write(f"8\n{section_layer}\n")
+                        f.write("66\n1\n")  # Vertices follow
+                        f.write("70\n8\n")  # 3D polyline flag
+
+                        for x, y, z in points:
+                            f.write("0\nVERTEX\n")
+                            f.write(f"8\n{section_layer}\n")
+                            f.write(f"10\n{x:.2f}\n")  # X = Easting
+                            f.write(f"20\n{y:.2f}\n")  # Y = Northing
+                            f.write(f"30\n{z:.2f}\n")  # Z = RL
+
+                        f.write("0\nSEQEND\n")
+                        exported_count += 1
+
+            # Export faults using original ordered vertices from section data
+            for (pdf, page), section_data in self.all_sections_data.items():
+                for line_name, line_data in section_data.get('polylines', {}).items():
+                    if not line_data.get('is_fault', False):
                         continue
 
-                    # Sort vertices by easting (X) for consistent ordering
-                    section_verts.sort(key=lambda v: v[0])
+                    vertices = line_data.get('vertices', [])
+                    northing = section_data.get('coord_system', {}).get('northing', 0)
 
-                    # Remove duplicates while preserving order
-                    unique_verts = []
-                    seen = set()
-                    for v in section_verts:
-                        key = (round(v[0], 2), round(v[1], 2), round(v[2], 2))
-                        if key not in seen:
-                            seen.add(key)
-                            unique_verts.append(v)
-
-                    if len(unique_verts) < 2:
+                    if len(vertices) < 4:
                         continue
 
-                    # Write as 3D polyline
+                    fault_name = line_data.get('fault_name', '') or line_data.get('fault_assignment', '') or 'FAULT'
+                    layer_name = fault_name.replace(' ', '_').replace('-', '_').replace('/', '_')
+
+                    # Convert flat vertices to 3D points
+                    points = []
+                    for i in range(0, len(vertices), 2):
+                        if i + 1 < len(vertices):
+                            points.append((vertices[i], northing, vertices[i + 1]))
+
+                    if len(points) < 2:
+                        continue
+
+                    # Write as 3D polyline - vertices in ORIGINAL order
                     section_layer = f"{layer_name}_{int(northing)}"
                     f.write("0\nPOLYLINE\n")
                     f.write(f"8\n{section_layer}\n")
-                    f.write("66\n1\n")  # Vertices follow
-                    f.write("70\n8\n")  # 3D polyline flag
+                    f.write("66\n1\n")
+                    f.write("70\n8\n")
 
-                    for x, y, z in unique_verts:
+                    for x, y, z in points:
                         f.write("0\nVERTEX\n")
                         f.write(f"8\n{section_layer}\n")
-                        f.write(f"10\n{x:.2f}\n")  # X = Easting
-                        f.write(f"20\n{y:.2f}\n")  # Y = Northing
-                        f.write(f"30\n{z:.2f}\n")  # Z = RL
+                        f.write(f"10\n{x:.2f}\n")
+                        f.write(f"20\n{y:.2f}\n")
+                        f.write(f"30\n{z:.2f}\n")
 
                     f.write("0\nSEQEND\n")
+                    exported_count += 1
 
-            # Also export individual points for each mesh vertex
-            for obj_name, mesh_data in self.object_meshes.items():
-                vertices = mesh_data.get('vertices', [])
-                if not vertices:
-                    continue
+            # Also export mesh vertices as points (for reference)
+            if self.object_meshes:
+                for obj_name, mesh_data in self.object_meshes.items():
+                    vertices = mesh_data.get('vertices', [])
+                    if not vertices:
+                        continue
 
-                layer_name = f"{obj_name.replace(' ', '_').replace('-', '_').replace('/', '_')}_POINTS"
+                    layer_name = f"{obj_name.replace(' ', '_').replace('-', '_').replace('/', '_')}_POINTS"
 
-                for vx, vy, vz in vertices:
-                    f.write("0\nPOINT\n")
-                    f.write(f"8\n{layer_name}\n")
-                    f.write(f"10\n{vx:.2f}\n")
-                    f.write(f"20\n{vy:.2f}\n")
-                    f.write(f"30\n{vz:.2f}\n")
+                    for vx, vy, vz in vertices:
+                        f.write("0\nPOINT\n")
+                        f.write(f"8\n{layer_name}\n")
+                        f.write(f"10\n{vx:.2f}\n")
+                        f.write(f"20\n{vy:.2f}\n")
+                        f.write(f"30\n{vz:.2f}\n")
 
             f.write("0\nENDSEC\n0\nEOF\n")
 
-        logger.info(f"Exported key points for {len(self.object_meshes)} objects to DXF")
+        logger.info(f"Exported {exported_count} polylines to DXF")
 
     def export_to_stl(self, filepath):
         """Export to STL format (simplified ASCII STL)."""
@@ -9582,8 +9673,14 @@ class GeologicalCrossSectionGUI:
         fault_groups = defaultdict(list)
         for (pdf, page), section_data in self.all_sections_data.items():
             for line_name, line_data in section_data.get('polylines', {}).items():
-                # Use fault_name which comes from PDF subject
-                fault_name = line_data.get('fault_name', '') or line_data.get('author', '')
+                # Use fault_name or fault_assignment which come from PDF subject
+                # DO NOT fall back to author - that's the f123456 tag we want to avoid!
+                fault_name = line_data.get('fault_name', '') or line_data.get('fault_assignment', '')
+                # Also check subject field directly as backup
+                if not fault_name:
+                    subject = line_data.get('subject', '')
+                    if subject and 'fault' in subject.lower():
+                        fault_name = subject.strip()
                 if fault_name and fault_name != 'UNKNOWN':
                     clean_name = fault_name.strip().upper()
                     if clean_name and not clean_name.startswith('['):
