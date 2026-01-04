@@ -4392,7 +4392,32 @@ class GeologicalCrossSectionGUI:
             blocks = self._group_units_by_northing_gap(units, factor=max_gap_factor)
 
             for block in blocks:
-                if len(block) < 2:
+                # Handle single-unit blocks - add flat polygon representation with caps
+                if len(block) == 1:
+                    single_unit = block[0]
+                    single_coords = np.array([
+                        (single_unit["vertices"][j], single_unit["vertices"][j + 1])
+                        for j in range(0, len(single_unit["vertices"]), 2)
+                        if j + 1 < len(single_unit["vertices"])
+                    ])
+                    if len(single_coords) >= 3:
+                        # Add front and back caps at same position (flat polygon)
+                        self._add_polygon_end_cap(
+                            single_coords,
+                            single_unit.get("northing", 0.0),
+                            single_unit.get("color", (0.5, 0.5, 0.5)),
+                            flip_normal=True,
+                            alpha=0.9,
+                            object_name=formation
+                        )
+                        self._add_polygon_end_cap(
+                            single_coords,
+                            single_unit.get("northing", 0.0),
+                            single_unit.get("color", (0.5, 0.5, 0.5)),
+                            flip_normal=False,
+                            alpha=0.9,
+                            object_name=formation
+                        )
                     continue
 
                 # Loft between adjacent units in this block if they are similar enough
